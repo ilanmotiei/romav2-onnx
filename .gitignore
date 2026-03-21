@@ -1,0 +1,36 @@
+# Model weights — too large for git (use Git LFS or store separately)
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Triton model weight directory (config.pbtxt is tracked; model.onnx is not)
+triton/model_repository/*/1/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Generated outputs (keep sample assets, ignore user-generated results)
+*_result.png
+!assets/match_result.png
+!assets/triton_result.png
