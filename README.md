@@ -1,6 +1,6 @@
 # RoMa v2 — ONNX & Triton Deployment
 
-Export, validate, and serve the [RoMa v2](https://github.com/Parskatt/RoMa) dense image matcher as an ONNX model, with full support for local inference and NVIDIA Triton Inference Server deployment.
+Export, validate, and serve the [RoMa v2](https://github.com/Parskatt/RoMaV2) dense image matcher as an ONNX model, with full support for local inference and NVIDIA Triton Inference Server deployment.
 
 RoMa v2 produces a **dense warp** and **overlap confidence map** between any two images — useful for visual localization, 3D reconstruction, and image alignment.
 
