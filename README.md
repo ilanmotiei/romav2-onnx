@@ -25,17 +25,29 @@ Input images (University of Toronto, large viewpoint change):
 
 ## Requirements
 
-**RoMa v2 source** (provides the `romav2` Python package):
+**Install everything in one command** (includes the `romav2` package pulled directly from GitHub):
+
 ```bash
-git clone https://github.com/Parskatt/RoMa
-cd RoMa
-pip install -e .
+git clone https://github.com/ilanmotiei/romav2-onnx
+cd romav2-onnx
+pip install ".[all]"
 ```
 
-**This repo's dependencies:**
+Or install only what you need:
+
 ```bash
-pip install onnx onnxruntime opencv-python-headless "tritonclient[http]"
+# Export + validate + visualise (no Triton client)
+pip install .
+
+# Add Triton client
+pip install ".[triton]"
 ```
+
+The `romav2` package is declared as a dependency pointing at the upstream repo:
+```
+romav2 @ git+https://github.com/Parskatt/RoMaV2.git
+```
+so there is no separate clone step.
 
 **For Triton server:**
 - Docker with the `nvcr.io/nvidia/tritonserver:23.12-py3` image (≈12 GB)
