@@ -25,29 +25,23 @@ Input images (University of Toronto, large viewpoint change):
 
 ## Requirements
 
-**Install everything in one command** (includes the `romav2` package pulled directly from GitHub):
-
 ```bash
 git clone https://github.com/ilanmotiei/romav2-onnx
 cd romav2-onnx
 pip install ".[all]"
 ```
 
-Or install only what you need:
+Or without the Triton client:
 
 ```bash
-# Export + validate + visualise (no Triton client)
 pip install .
-
-# Add Triton client
-pip install ".[triton]"
 ```
 
-The `romav2` package is declared as a dependency pointing at the upstream repo:
-```
-romav2 @ git+https://github.com/Parskatt/RoMaV2.git
-```
-so there is no separate clone step.
+The modified `romav2` source is embedded directly in `src/` — no separate clone or install step needed. It is a fork of [Parskatt/RoMaV2](https://github.com/Parskatt/RoMaV2) with the following changes required for ONNX export:
+- `enable_amp` flag added to `Matcher`, `Refiners`, `FineFeatures`, `DPTHead` and `VGG` so AMP/bfloat16 can be disabled at export time
+- `pos_embed_rope_dtype` added to `Matcher.Cfg` and `vit_from_name` to keep RoPE in float32
+- `native_torch_local_corr` vectorised (removed Python `for` loop over batch) for dynamic-batch ONNX compatibility
+- `@torch.inference_mode()` removed from `RoMaV2.forward` (blocks the JIT tracer)
 
 **For Triton server:**
 - Docker with the `nvcr.io/nvidia/tritonserver:23.12-py3` image (≈12 GB)

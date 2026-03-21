@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "romav2-onnx"
@@ -10,14 +10,14 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    # RoMa v2 source model
-    "romav2 @ git+https://github.com/Parskatt/RoMaV2.git",
-
-    # Core
+    # romav2 is embedded in src/ (modified fork of Parskatt/RoMaV2)
     "torch>=2.5",
+    "torchvision>=0.20",
     "numpy>=1.24",
     "pillow>=10.0",
     "einops>=0.7",
+    "rich>=13.0",
+    "tqdm>=4.65",
 
     # ONNX export + validation
     "onnx>=1.16",
@@ -36,4 +36,4 @@ all = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["scripts"]
+where = ["src"]

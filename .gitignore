@@ -11,6 +11,7 @@ triton/model_repository/*/1/
 # Python
 __pycache__/
 *.py[cod]
+src/**/__pycache__/
 *.pyo
 .eggs/
 *.egg-info/
