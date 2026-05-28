@@ -3,6 +3,7 @@
 Usage:
     python scripts/visualize.py                        # PyTorch model
     python scripts/visualize.py --onnx romav2_fast.onnx  # ONNX model
+    python scripts/visualize.py --onnx romav2_fast_bidir.onnx  # bidirectional ONNX
     python scripts/visualize.py --img-a assets/toronto_A.jpg --img-b assets/toronto_B.jpg
 """
 
@@ -51,10 +52,11 @@ def draw_correspondences(
     seed: int = 0,
 ) -> np.ndarray:
     """Draw n random correspondence lines on a side-by-side canvas."""
-    import cv2
+    from PIL import ImageDraw
 
     H, W = img_A.shape[:2]
-    canvas = np.concatenate([img_A, img_B], axis=1).copy()
+    canvas = Image.fromarray(np.concatenate([img_A, img_B], axis=1).copy())
+    draw = ImageDraw.Draw(canvas)
 
     rng = np.random.default_rng(seed)
     # Only sample from high-overlap regions
@@ -72,11 +74,60 @@ def draw_correspondences(
         x_B = int(np.clip(round(wx), 0, W - 1)) + W  # offset for right panel
         y_B = int(np.clip(round(wy), 0, H - 1))
         color = tuple(int(c) for c in rng.integers(80, 255, 3))
-        cv2.line(canvas, (x_A, y_A), (x_B, y_B), color, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (x_A, y_A), 3, color, -1)
-        cv2.circle(canvas, (x_B, y_B), 3, color, -1)
+        draw.line([(x_A, y_A), (x_B, y_B)], fill=color, width=1)
+        draw.ellipse((x_A - 3, y_A - 3, x_A + 3, y_A + 3), fill=color)
+        draw.ellipse((x_B - 3, y_B - 3, x_B + 3, y_B + 3), fill=color)
 
-    return canvas
+    return np.asarray(canvas)
+
+
+def confidence_to_colour(confidence: np.ndarray) -> np.ndarray:
+    """Convert a confidence map in [0, 1] to a compact heatmap."""
+    x = confidence.clip(0, 1)[..., None]
+    stops = np.array(
+        [
+            [0, 0, 4],
+            [87, 15, 109],
+            [187, 55, 84],
+            [249, 142, 8],
+            [252, 255, 164],
+        ],
+        dtype=np.float32,
+    )
+    scaled = x * (len(stops) - 1)
+    lo = np.floor(scaled).astype(np.int32).clip(0, len(stops) - 1)
+    hi = (lo + 1).clip(0, len(stops) - 1)
+    frac = scaled - lo
+    colour = stops[lo[..., 0]] * (1 - frac) + stops[hi[..., 0]] * frac
+    return colour.clip(0, 255).astype(np.uint8)
+
+
+def build_direction_composite(
+    img_query: np.ndarray,
+    img_reference: np.ndarray,
+    warp: np.ndarray,
+    overlap: np.ndarray,
+    *,
+    seed: int,
+) -> np.ndarray:
+    """Build a 2x3 visualization for one matching direction."""
+    warped_reference = warp_image(img_reference, warp)
+
+    conf_colour = confidence_to_colour(overlap[..., 0])
+
+    lines = draw_correspondences(img_query, img_reference, warp, overlap, n=150, seed=seed)
+
+    alpha = overlap[..., :1].clip(0, 1)
+    blend = (
+        img_query.astype(float) * (1 - alpha)
+        + warped_reference.astype(float) * alpha
+    ).clip(0, 255).astype(np.uint8)
+
+    H, W = img_query.shape[:2]
+    row1 = np.concatenate([img_query, img_reference, warped_reference], axis=1)
+    lines_resized = np.asarray(Image.fromarray(lines).resize((W, H), Image.LANCZOS))
+    row2 = np.concatenate([conf_colour, blend, lines_resized], axis=1)
+    return np.concatenate([row1, row2], axis=0)
 
 
 # ── inference ────────────────────────────────────────────────────────────────
@@ -87,7 +138,10 @@ def run_pytorch(img_A_t: torch.Tensor, img_B_t: torch.Tensor, setting: str):
     wrapper = build_model(setting, force_cpu=True)
     with torch.no_grad():
         warp, overlap = wrapper(img_A_t, img_B_t)
-    return warp[0].numpy(), overlap[0].numpy()  # H W 2,  H W 1
+    return {
+        "warp_AB": warp[0].numpy(),
+        "overlap_AB": overlap[0].numpy(),
+    }
 
 
 def run_onnx(
@@ -100,11 +154,15 @@ def run_onnx(
     import onnxruntime as ort
 
     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-    warp, overlap = sess.run(
+    output_names = [output.name for output in sess.get_outputs()]
+    output_values = sess.run(
         None,
         {"img_A": img_A_t.numpy(), "img_B": img_B_t.numpy()},
     )
-    return warp[0], overlap[0]  # H W 2,  H W 1
+    return {
+        name: value[0]
+        for name, value in zip(output_names, output_values)
+    }
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -130,40 +188,36 @@ def main():
 
     if args.onnx:
         print(f"Running ONNX inference from {args.onnx} ...")
-        warp, overlap = run_onnx(img_A_np, img_B_np, img_A_t, img_B_t, args.onnx)
+        outputs = run_onnx(img_A_np, img_B_np, img_A_t, img_B_t, args.onnx)
     else:
         print("Running PyTorch inference ...")
-        warp, overlap = run_pytorch(img_A_t, img_B_t, args.setting)
+        outputs = run_pytorch(img_A_t, img_B_t, args.setting)
 
-    print(f"warp   : shape={warp.shape}, min={warp.min():.3f}, max={warp.max():.3f}")
-    print(f"overlap: shape={overlap.shape}, min={overlap.min():.3f}, max={overlap.max():.3f}")
+    for name, value in outputs.items():
+        print(f"{name}: shape={value.shape}, min={value.min():.3f}, max={value.max():.3f}")
 
-    # 1) Warp image B into image A's coordinate system
-    warped_B = warp_image(img_B_np, warp)
+    composite_ab = build_direction_composite(
+        img_A_np,
+        img_B_np,
+        outputs["warp_AB"],
+        outputs["overlap_AB"],
+        seed=0,
+    )
+    composites = [composite_ab]
 
-    # 2) Overlap / confidence map  (grayscale → colourmap)
-    conf_uint8 = (overlap[..., 0] * 255).clip(0, 255).astype(np.uint8)
-    import cv2
-    conf_colour = cv2.applyColorMap(conf_uint8, cv2.COLORMAP_INFERNO)
-    conf_colour = cv2.cvtColor(conf_colour, cv2.COLOR_BGR2RGB)
+    has_ba = "warp_BA" in outputs and "overlap_BA" in outputs
+    if has_ba:
+        composite_ba = build_direction_composite(
+            img_B_np,
+            img_A_np,
+            outputs["warp_BA"],
+            outputs["overlap_BA"],
+            seed=1,
+        )
+        separator = np.full((12, composite_ab.shape[1], 3), 255, dtype=np.uint8)
+        composites.extend([separator, composite_ba])
 
-    # 3) Correspondence lines
-    lines = draw_correspondences(img_A_np, img_B_np, warp, overlap, n=150)
-
-    # 4) Blend: alpha-composite warped_B onto img_A using overlap as mask
-    alpha = overlap[..., :1].clip(0, 1)
-    blend = (img_A_np.astype(float) * (1 - alpha) + warped_B.astype(float) * alpha).clip(0, 255).astype(np.uint8)
-
-    # Build composite output
-    # Row 1: img_A | img_B | warped_B_in_A
-    # Row 2: overlap_confidence | blend | correspondences (half-size)
-    row1 = np.concatenate([img_A_np, img_B_np, warped_B], axis=1)
-
-    # resize correspondences to same height as a single image
-    lines_resized = cv2.resize(lines, (W, H))
-    row2 = np.concatenate([conf_colour, blend, lines_resized], axis=1)
-
-    composite = np.concatenate([row1, row2], axis=0)
+    composite = np.concatenate(composites, axis=0)
 
     out_path = args.out
     Image.fromarray(composite).save(out_path)
@@ -171,12 +225,11 @@ def main():
 
     # Labels
     print("\nLayout:")
-    print("  Top-left:    Image A (query)")
-    print("  Top-center:  Image B (reference)")
-    print("  Top-right:   Image B warped into A's coordinate system")
-    print("  Bot-left:    Overlap confidence (bright = high confidence)")
-    print("  Bot-center:  Alpha-blended A + warped-B")
-    print("  Bot-right:   100+ correspondences drawn (high-confidence only)")
+    print("  A→B row 1: Image A | Image B | Image B warped into A")
+    print("  A→B row 2: Overlap confidence | Alpha blend | Correspondences")
+    if has_ba:
+        print("  B→A row 1: Image B | Image A | Image A warped into B")
+        print("  B→A row 2: Overlap confidence | Alpha blend | Correspondences")
 
 
 if __name__ == "__main__":
