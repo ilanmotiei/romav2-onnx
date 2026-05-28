@@ -2,7 +2,7 @@ name: "romav2"
 platform: "onnxruntime_onnx"
 
 # max_batch_size: 0 — batch dim is explicit in `dims`, which lets us exactly
-# match the ONNX model's fully-dynamic shape declaration [-1,-1,-1,-1].
+# match the ONNX model's explicit batch dimension.
 # The client must include the batch dimension in every request.
 max_batch_size: 0
 
@@ -23,12 +23,12 @@ output [
   {
     name: "warp_AB"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]   # [ batch, H, W, 2 ] — all symbolic in ONNX
+    dims: [ -1, -1, -1, -1 ]  # [ batch, H, W, 2 ]
   },
   {
     name: "overlap_AB"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]   # [ batch, H, W, 1 ]
+    dims: [ -1, -1, -1, -1 ]  # [ batch, H, W, 1 ]
   }
 ]
 

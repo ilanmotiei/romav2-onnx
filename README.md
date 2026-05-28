@@ -54,6 +54,12 @@ The modified `romav2` source is embedded directly in `src/` — no separate clon
 # Fast setting (512×512 input, ~350 MB model)
 python scripts/export_onnx.py --output romav2_fast.onnx --setting fast
 
+# Fast setting with both A→B and B→A dense outputs
+python scripts/export_onnx.py \
+    --output romav2_fast_bidir.onnx \
+    --setting fast \
+    --bidirectional
+
 # Base setting (640×640)
 python scripts/export_onnx.py --output romav2_base.onnx --setting base
 ```
@@ -62,7 +68,7 @@ Available settings:
 
 | Setting | Input size | Notes |
 |---------|-----------|-------|
-| `turbo` | 256×256 | Fastest, least accurate |
+| `turbo` | 320×320 | Fastest, least accurate |
 | `fast`  | 512×512 | Good balance |
 | `base`  | 640×640 | Higher accuracy |
 
@@ -75,6 +81,8 @@ The script:
 **Inputs:** `img_A`, `img_B` — `float32 [B, 3, H, W]`, values in `[0, 1]`
 **Outputs:** `warp_AB` — `float32 [B, H, W, 2]` (normalised coords in `[-1, 1]`), `overlap_AB` — `float32 [B, H, W, 1]` (probability in `[0, 1]`)
 
+Add `--bidirectional` to also export `warp_BA` and `overlap_BA` with the same shapes. This is slower because the matcher/refiners also compute the B→A direction, but it is useful when downstream sampling or geometry wants both directions.
+
 ---
 
 ## 2 — Validate
@@ -83,6 +91,12 @@ Runs both the PyTorch model and the exported ONNX model on identical CPU inputs 
 
 ```bash
 python scripts/export_onnx.py --validate romav2_fast.onnx --setting fast
+
+# Validate a bidirectional export
+python scripts/export_onnx.py \
+    --validate romav2_fast_bidir.onnx \
+    --setting fast \
+    --bidirectional
 ```
 
 Expected output:
@@ -108,6 +122,9 @@ Validation passed — PyTorch and ONNX outputs match.
 # Uses sample images included in this repo
 python scripts/visualize.py --onnx romav2_fast.onnx --out result.png
 
+# Bidirectional ONNX exports are detected automatically and produce both directions
+python scripts/visualize.py --onnx romav2_fast_bidir.onnx --out bidir_result.png
+
 # Or PyTorch model
 python scripts/visualize.py --out result.png
 
@@ -129,6 +146,10 @@ The output is a 6-panel composite (2×3 grid):
 |-------------|---------------|--------------|
 | Confidence heatmap | Alpha blend | Dense correspondences |
 
+For bidirectional ONNX exports, the image stacks two 6-panel composites: A→B first, then B→A.
+
+![bidirectional ONNX result](assets/bidir_onnx_result.png)
+
 ---
 
 ## 4 — Triton Inference Server
@@ -141,6 +162,17 @@ The `triton/model_repository/romav2/config.pbtxt` is already configured. You onl
 mkdir -p triton/model_repository/romav2/1
 cp romav2_fast.onnx triton/model_repository/romav2/1/model.onnx
 ```
+
+For a bidirectional export, use the separate config:
+
+```bash
+mkdir -p triton/model_repository/romav2_bidirectional/1
+cp romav2_fast_bidir.onnx triton/model_repository/romav2_bidirectional/1/model.onnx
+```
+
+If you export `turbo` or `base`, update the `img_A`/`img_B` input dimensions in the relevant `config.pbtxt` to `320×320` or `640×640`.
+
+The checked-in Triton configs keep output dimensions fully dynamic for compatibility with `nvcr.io/nvidia/tritonserver:23.12-py3`. If a newer Triton version reports that the model expects a concrete last output dimension, set warp outputs to `[ -1, -1, -1, 2 ]` and overlap outputs to `[ -1, -1, -1, 1 ]` in that environment.
 
 ### 4.2 Start the server
 
@@ -200,9 +232,12 @@ romav2-onnx/
 │   └── triton_client.py      # Triton HTTP client + visualisation
 ├── triton/
 │   └── model_repository/
-│       └── romav2/
+│       ├── romav2/
 │           ├── config.pbtxt  # Triton model config
 │           └── 1/            # Place model.onnx here (gitignored)
+│       └── romav2_bidirectional/
+│           ├── config.pbtxt  # Triton config for --bidirectional exports
+│           └── 1/            # Place bidirectional model.onnx here (gitignored)
 └── assets/
     ├── toronto_A.jpg          # Sample input A
     ├── toronto_B.jpg          # Sample input B
