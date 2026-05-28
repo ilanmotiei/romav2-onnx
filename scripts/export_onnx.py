@@ -21,6 +21,10 @@ Exported outputs:
 With --bidirectional, the export also includes:
     warp_BA     (B, H, W, 2)
     overlap_BA  (B, H, W, 1)
+
+With --include-precision, the export also includes:
+    precision_AB  (B, H, W, 2, 2)
+    precision_BA  (B, H, W, 2, 2)  # when combined with --bidirectional
 """
 
 from __future__ import annotations
@@ -57,10 +61,17 @@ class RoMaV2OnnxWrapper(nn.Module):
     outputs and returns them as a plain tuple.
     """
 
-    def __init__(self, model: RoMaV2, *, bidirectional_outputs: bool = False) -> None:
+    def __init__(
+        self,
+        model: RoMaV2,
+        *,
+        bidirectional_outputs: bool = False,
+        precision_outputs: bool = False,
+    ) -> None:
         super().__init__()
         self.model = model
         self.bidirectional_outputs = bidirectional_outputs
+        self.precision_outputs = precision_outputs
 
     def forward(
         self, img_A: torch.Tensor, img_B: torch.Tensor
@@ -68,8 +79,10 @@ class RoMaV2OnnxWrapper(nn.Module):
         preds = self.model(img_A, img_B)
         warp_AB = preds["warp_AB"]
         confidence_AB = preds["confidence_AB"]
-        overlap_AB, _ = _map_confidence(confidence=confidence_AB, threshold=None)
+        overlap_AB, precision_AB = _map_confidence(confidence=confidence_AB, threshold=None)
         if not self.bidirectional_outputs:
+            if self.precision_outputs:
+                return warp_AB, overlap_AB, precision_AB
             return warp_AB, overlap_AB
 
         warp_BA = preds["warp_BA"]
@@ -78,7 +91,9 @@ class RoMaV2OnnxWrapper(nn.Module):
             raise RuntimeError(
                 "Bidirectional export requested, but model did not produce B->A outputs"
             )
-        overlap_BA, _ = _map_confidence(confidence=confidence_BA, threshold=None)
+        overlap_BA, precision_BA = _map_confidence(confidence=confidence_BA, threshold=None)
+        if self.precision_outputs:
+            return warp_AB, overlap_AB, precision_AB, warp_BA, overlap_BA, precision_BA
         return warp_AB, overlap_AB, warp_BA, overlap_BA
 
 
@@ -98,6 +113,7 @@ def build_model(
     *,
     force_cpu: bool = True,
     bidirectional: bool = False,
+    include_precision: bool = False,
 ) -> RoMaV2OnnxWrapper:
     """Build the model wrapper.
 
@@ -137,7 +153,11 @@ def build_model(
     model.to(target_dev).float()
 
     model.eval()
-    wrapper = RoMaV2OnnxWrapper(model, bidirectional_outputs=bidirectional)
+    wrapper = RoMaV2OnnxWrapper(
+        model,
+        bidirectional_outputs=bidirectional,
+        precision_outputs=include_precision,
+    )
     wrapper.eval()
     return wrapper
 
@@ -149,8 +169,13 @@ def export(
     setting: str = "fast",
     opset: int = 17,
     bidirectional: bool = False,
+    include_precision: bool = False,
 ) -> None:
-    wrapper = build_model(setting, bidirectional=bidirectional)
+    wrapper = build_model(
+        setting,
+        bidirectional=bidirectional,
+        include_precision=include_precision,
+    )
 
     # Input resolution is determined by the chosen setting.
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
@@ -158,8 +183,12 @@ def export(
     dummy_B = torch.randn(1, 3, H, W)
 
     output_names = ["warp_AB", "overlap_AB"]
+    if include_precision:
+        output_names.append("precision_AB")
     if bidirectional:
         output_names.extend(["warp_BA", "overlap_BA"])
+        if include_precision:
+            output_names.append("precision_BA")
 
     dynamic_axes = {
         "img_A": {0: "batch"},
@@ -169,7 +198,8 @@ def export(
 
     print(
         f"Exporting with setting='{setting}', input {H}x{W}, "
-        f"opset={opset}, bidirectional={bidirectional} ..."
+        f"opset={opset}, bidirectional={bidirectional}, "
+        f"include_precision={include_precision} ..."
     )
 
     with torch.no_grad():
@@ -199,6 +229,7 @@ def validate(
     setting: str = "fast",
     atol: float = 2e-2,
     bidirectional: bool = False,
+    include_precision: bool = False,
 ) -> None:
     import time
 
@@ -215,7 +246,12 @@ def validate(
     t0 = time.time()
     # ← potential hang: downloading 1 GB weights from GitHub
     if sys.gettrace() is not None: breakpoint()  # inspect `setting`
-    wrapper = build_model(setting, force_cpu=True, bidirectional=bidirectional)
+    wrapper = build_model(
+        setting,
+        force_cpu=True,
+        bidirectional=bidirectional,
+        include_precision=include_precision,
+    )
     print(f"      Done in {time.time() - t0:.1f}s  (model device: cpu)")
 
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
@@ -232,8 +268,12 @@ def validate(
     with torch.no_grad():
         pt_outputs = wrapper(img_A, img_B)
     output_names = ["warp_AB", "overlap_AB"]
+    if include_precision:
+        output_names.append("precision_AB")
     if bidirectional:
         output_names.extend(["warp_BA", "overlap_BA"])
+        if include_precision:
+            output_names.append("precision_BA")
     pt_outputs_np = {
         name: value.numpy() for name, value in zip(output_names, pt_outputs)
     }
@@ -308,6 +348,8 @@ if __name__ == "__main__":
                         help="ONNX opset version")
     parser.add_argument("--bidirectional", action="store_true",
                         help="export both A->B and B->A dense warp/overlap outputs")
+    parser.add_argument("--include-precision", action="store_true",
+                        help="also export precision matrices used by RoMaV2.sample")
     args = parser.parse_args()
 
     if args.validate:
@@ -315,6 +357,7 @@ if __name__ == "__main__":
             args.validate,
             setting=args.setting,
             bidirectional=args.bidirectional,
+            include_precision=args.include_precision,
         )
     else:
         export(
@@ -322,4 +365,5 @@ if __name__ == "__main__":
             setting=args.setting,
             opset=args.opset,
             bidirectional=args.bidirectional,
+            include_precision=args.include_precision,
         )

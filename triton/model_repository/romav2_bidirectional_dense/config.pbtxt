@@ -1,0 +1,56 @@
+name: "romav2_bidirectional_dense"
+platform: "onnxruntime_onnx"
+max_batch_size: 0
+
+input [
+  {
+    name: "img_A"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 512, 512 ]
+  },
+  {
+    name: "img_B"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 512, 512 ]
+  }
+]
+
+output [
+  {
+    name: "warp_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "overlap_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "precision_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1, -1 ]
+  },
+  {
+    name: "warp_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "overlap_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "precision_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1, -1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]
