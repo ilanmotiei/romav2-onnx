@@ -190,6 +190,24 @@ cp romav2_fast_bidir_precision.onnx \
 
 Then call the user-facing ensemble model `romav2_bidirectional_sampled`, not the dense model. The dense tensors stay inside Triton.
 
+For the fast sampled ensemble path, the Triton Python sampler uses PyTorch via DLPack and should run as a GPU Python backend instance. The plain Triton `py3` images do not always include PyTorch, so build a torch-enabled Triton image before deploying this model:
+
+```bash
+docker build \
+  -f triton/Dockerfile.torch-sampler \
+  -t romav2-triton-torch-sampler:25.07-py3 \
+  triton
+```
+
+On Kubernetes, request a GPU and use the NVIDIA runtime class if your cluster requires it:
+
+```yaml
+runtimeClassName: nvidia
+resources:
+  limits:
+    nvidia.com/gpu: 1
+```
+
 If you export `turbo` or `base`, update the `img_A`/`img_B` input dimensions in the relevant `config.pbtxt` to `320×320` or `640×640`.
 
 The checked-in Triton configs keep output dimensions fully dynamic for compatibility with `nvcr.io/nvidia/tritonserver:23.12-py3`. If a newer Triton version reports that the model expects concrete output dimensions, set warp outputs to `[ -1, -1, -1, 2 ]`, overlap outputs to `[ -1, -1, -1, 1 ]`, and precision outputs to `[ -1, -1, -1, 2, 2 ]` in that environment.
@@ -205,7 +223,7 @@ docker run --rm -d \
   tritonserver --model-repository=/models
 ```
 
-Add `--gpus all` if you have a CUDA GPU. Wait ~10 seconds, then verify:
+Add `--gpus all` if you have a CUDA GPU. For `romav2_bidirectional_sampled`, use the torch-enabled image above so the Python sampler can stay on GPU. Wait ~10 seconds, then verify:
 
 ```bash
 curl http://localhost:8000/v2/health/ready        # → HTTP 200
@@ -282,7 +300,7 @@ romav2-onnx/
 │       │   ├── config.pbtxt  # Internal dense ONNX model for the sampled ensemble
 │       │   └── 1/            # Place precision-exported bidirectional model.onnx here
 │       ├── romav2_sampler/
-│       │   ├── config.pbtxt  # Triton Python backend sampler
+│       │   ├── config.pbtxt  # Triton Python backend sampler, GPU torch/DLPack path
 │       │   └── 1/
 │       └── romav2_bidirectional_sampled/
 │           ├── config.pbtxt  # User-facing ensemble returning sparse samples
@@ -301,4 +319,4 @@ romav2-onnx/
 - **Float32 only** — all AMP/bfloat16 paths are disabled at export time; the full graph runs in float32 for ORT compatibility.
 - **Static H/W** — height and width are baked into the ONNX graph per setting. Export a separate `.onnx` per setting if you need multiple resolutions.
 - **Batch dimension** — the Triton config uses `max_batch_size: 0` with an explicit batch dim in `dims`, matching the ONNX model's fully-dynamic shape annotation. Pass batches of size ≥ 1 from your client.
-- **GPU** — the exported model runs on CPU by default in both ORT and Triton. For CUDA GPU inference in Triton, set `kind: KIND_GPU` in `config.pbtxt` and pass `--gpus all` to Docker.
+- **GPU** — dense ONNX inference can run on CUDA with `KIND_GPU`. The sampled ensemble also needs a torch-enabled Triton image so `romav2_sampler` can consume DLPack tensors and run sampling on CUDA instead of copying dense tensors back to CPU.

@@ -1,0 +1,7 @@
+ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver:25.07-py3
+FROM ${TRITON_IMAGE}
+
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+    && python3 -m pip install --no-cache-dir torch --index-url ${TORCH_INDEX_URL}
