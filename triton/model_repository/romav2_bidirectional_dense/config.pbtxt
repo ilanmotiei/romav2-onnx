@@ -19,12 +19,12 @@ output [
   {
     name: "warp_AB"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 2 ]
   },
   {
     name: "overlap_AB"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 1 ]
   },
   {
     name: "precision_AB"
@@ -34,12 +34,12 @@ output [
   {
     name: "warp_BA"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 2 ]
   },
   {
     name: "overlap_BA"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 1 ]
   },
   {
     name: "precision_BA"
@@ -51,6 +51,6 @@ output [
 instance_group [
   {
     count: 1
-    kind: KIND_CPU
+    kind: KIND_GPU
   }
 ]
