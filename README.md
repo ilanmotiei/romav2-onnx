@@ -327,7 +327,54 @@ sampled_precision_A  (N, 2, 2)
 sampled_precision_B  (N, 2, 2)
 ```
 
-### 4.4 Use the client in Python
+### 4.4 Run Mega-1500
+
+RoMaV2 reports MegaDepth-1500 / Mega-1500 and ScanNet-1500 pose-estimation
+benchmarks. This repo includes a Triton adapter for Mega-1500 so the benchmark
+can call the sampled ensemble as if it were a Python RoMaV2 model.
+
+Prepare the MegaDepth benchmark data under:
+
+```text
+data/megadepth/
+```
+
+At minimum, the Mega-1500 split files must be present:
+
+```text
+data/megadepth/0015_0.1_0.3.npz
+data/megadepth/0015_0.3_0.5.npz
+data/megadepth/0022_0.1_0.3.npz
+data/megadepth/0022_0.3_0.5.npz
+data/megadepth/0022_0.5_0.7.npz
+```
+
+Check the data layout without running inference:
+
+```bash
+python scripts/benchmark_triton_mega1500.py --check-data
+```
+
+Run the full benchmark against the fast sampled ensemble:
+
+```bash
+python scripts/benchmark_triton_mega1500.py \
+    --data-root data/megadepth \
+    --url localhost:8000 \
+    --model romav2_bidirectional_fast_sampled
+```
+
+For gRPC, use the gRPC port and protocol:
+
+```bash
+python scripts/benchmark_triton_mega1500.py \
+    --data-root data/megadepth \
+    --url localhost:8001 \
+    --protocol grpc \
+    --model romav2_bidirectional_fast_sampled
+```
+
+### 4.5 Use the client in Python
 
 ```python
 from scripts.triton_client import infer
