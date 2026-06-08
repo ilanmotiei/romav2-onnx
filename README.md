@@ -374,6 +374,23 @@ python scripts/benchmark_triton_mega1500.py \
     --model romav2_bidirectional_fast_sampled
 ```
 
+For fast qualitative checks, run a deterministic Mega-1500 subset. This uses
+the same pose-estimation metric and all five scene split files, but only the
+first `N` pairs from each scene and one stochastic sample per pair:
+
+```bash
+python scripts/benchmark_triton_mega1500.py \
+    --data-root data/megadepth \
+    --url localhost:8001 \
+    --protocol grpc \
+    --model romav2_bidirectional_fast_sampled \
+    --samples-per-pair 1 \
+    --max-pairs-per-scene 20
+```
+
+The subset score is useful for regressions and sanity checks, but it is not the
+official Mega-1500 score.
+
 ### 4.5 Use the client in Python
 
 ```python

@@ -256,6 +256,6 @@ def estimate_pose_cv2_ransac(
 
 
 def compute_relative_pose(R1, t1, R2, t2):
-    rots = R2 @ (R1.mT)
+    rots = R2 @ np.swapaxes(R1, -1, -2)
     trans = -rots @ t1 + t2
     return rots, trans

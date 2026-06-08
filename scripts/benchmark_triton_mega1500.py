@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,11 @@ MEGA1500_SCENES = [
 
 
 def load_mega1500_class() -> type:
-    benchmark_path = Path(__file__).resolve().parents[1] / "src" / "romav2" / "benchmarks" / "mega1500.py"
+    repo_root = Path(__file__).resolve().parents[1]
+    src_root = repo_root / "src"
+    if str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
+    benchmark_path = repo_root / "src" / "romav2" / "benchmarks" / "mega1500.py"
     spec = importlib.util.spec_from_file_location("romav2_mega1500_direct", benchmark_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load Mega1500 benchmark from {benchmark_path}")
@@ -161,6 +166,10 @@ def main() -> None:
     parser.add_argument("--protocol", choices=["http", "grpc"], default="http")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--samples-per-pair", type=int, default=5,
+                        help="Number of stochastic samples per pair; upstream Mega-1500 uses 5")
+    parser.add_argument("--max-pairs-per-scene", type=int, default=None,
+                        help="Evaluate only the first N pairs per scene for fast smoke checks")
     parser.add_argument("--check-data", action="store_true", help="Only check that Mega-1500 files exist")
     args = parser.parse_args()
 
@@ -170,7 +179,11 @@ def main() -> None:
         raise SystemExit(0 if data_ok else 1)
 
     Mega1500 = load_mega1500_class()
-    benchmark = Mega1500(str(data_root))
+    benchmark = Mega1500(
+        str(data_root),
+        samples_per_pair=args.samples_per_pair,
+        max_pairs_per_scene=args.max_pairs_per_scene,
+    )
     model = TritonSampledRoMaV2(
         url=args.url,
         model_name=args.model,
