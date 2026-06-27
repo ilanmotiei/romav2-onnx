@@ -7,6 +7,10 @@ Usage:
     # Fast setting with both A->B and B->A outputs:
     python scripts/export_onnx.py --bidirectional --output romav2_fast_bidir.onnx
 
+    # TensorRT-ready (bakes RoPE -> no If/Range so TensorRT can parse the graph;
+    # composes with --bidirectional for the dense/bidir model):
+    python scripts/export_onnx.py --trt --output romav2_fast_trt.onnx
+
     # Validate an already-exported model:
     python scripts/export_onnx.py --validate romav2_fast.onnx
 
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -162,6 +167,90 @@ def build_model(
     return wrapper
 
 
+# ── TensorRT prep: bake RoPE to constants ─────────────────────────────────────
+
+def bake_rope_for_trt(wrapper: RoMaV2OnnxWrapper, H: int, W: int) -> int:
+    """Replace every RopePositionEmbedding.forward with a constant lookup.
+
+    Why: RoMaV2's DINOv3 RoPE (src/romav2/vit/rope.py) computes sin/cos from the
+    patch-grid (H, W) via ``torch.arange(...)`` + ``angles.tile(2)``.  The tracer
+    emits these as a ``Range`` and an ``If`` with no static shape, and TensorRT's
+    ONNX parser rejects the ``If`` ("has no shape specified"), so TRT cannot
+    capture the backbone (whether via standalone trtexec or ONNX Runtime's
+    TensorRT execution provider).
+
+    The export pins the image resolution (dynamic_axes only covers batch), so the
+    patch-grid (H, W) — and therefore sin/cos — is constant.  We run one dry
+    forward to capture each RoPE module's (sin, cos) output, register them as
+    buffers, and swap in a ``forward`` that just returns them.  Result: no
+    Range/If, so TensorRT can parse the backbone — build the engine offline with
+    trtexec (recommended for this ~1.4GB model) or via ORT's TensorRT EP.
+
+    Numerically a no-op for the deployed fixed-resolution graph: RoPE output
+    depends only on (H, W), never on image content.  GridSample and any other op
+    TRT doesn't support fall back gracefully — no graph surgery needed.
+
+    Composes with --bidirectional/--include-precision: it walks the same module
+    tree regardless of how many outputs the wrapper exposes.
+
+    Returns the number of RoPE modules baked.
+    """
+    # Match by class name, NOT isinstance: the matcher uses
+    # romav2.vit.rope.RopePositionEmbedding, but the DINOv3 descriptor backbone
+    # (loaded from torch.hub) carries its OWN dinov3.layers...RopePositionEmbedding
+    # — identical code, different class object. Both emit the Range/Tile/If we must
+    # bake, so we can't filter on a single imported class.
+    rope_mods = [m for m in wrapper.modules()
+                 if type(m).__name__ == "RopePositionEmbedding"]
+    if not rope_mods:
+        raise RuntimeError("No RopePositionEmbedding modules found — nothing to bake.")
+
+    captured: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    seen_hw: dict[int, tuple[int, int]] = {}
+
+    def _make_hook(mod):
+        def _hook(module, args, kwargs, output):
+            hw = (int(kwargs["H"]), int(kwargs["W"]))
+            if id(mod) in seen_hw and seen_hw[id(mod)] != hw:
+                # A single module exercised at two resolutions can't be baked to
+                # one constant — would only happen if the export stopped pinning
+                # H/W. Fail loud rather than silently bake the wrong grid.
+                raise RuntimeError(
+                    f"RoPE module called at {hw} and {seen_hw[id(mod)]}; "
+                    "cannot bake a constant. Keep the export resolution fixed."
+                )
+            seen_hw[id(mod)] = hw
+            captured[id(mod)] = (output[0].detach().clone(), output[1].detach().clone())
+        return _hook
+
+    handles = [m.register_forward_hook(_make_hook(m), with_kwargs=True) for m in rope_mods]
+    try:
+        with torch.no_grad():
+            wrapper(torch.randn(1, 3, H, W), torch.randn(1, 3, H, W))
+    finally:
+        for h in handles:
+            h.remove()
+
+    for m in rope_mods:
+        if id(m) not in captured:
+            raise RuntimeError(
+                "A RoPE module was not exercised by the dry forward; cannot bake it."
+            )
+        sin, cos = captured[id(m)]
+        m.register_buffer("_trt_sin", sin, persistent=False)
+        m.register_buffer("_trt_cos", cos, persistent=False)
+
+        def _const_forward(self, *, H, W):  # noqa: N803 — match the original signature
+            return (self._trt_sin, self._trt_cos)
+
+        m.forward = types.MethodType(_const_forward, m)
+
+    grids = {hw for hw in seen_hw.values()}
+    print(f"Baked RoPE for {len(rope_mods)} module(s) at patch grid(s) {sorted(grids)} "
+          f"(image {H}x{W}) → no Range/If, backbone is TRT-parseable.")
+    return len(rope_mods)
+
+
 # ── Export ───────────────────────────────────────────────────────────────────
 
 def export(
@@ -170,6 +259,7 @@ def export(
     opset: int = 17,
     bidirectional: bool = False,
     include_precision: bool = False,
+    trt: bool = False,
 ) -> None:
     wrapper = build_model(
         setting,
@@ -179,6 +269,11 @@ def export(
 
     # Input resolution is determined by the chosen setting.
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
+
+    if trt:
+        # Make the graph TensorRT-parseable so TRT can capture the backbone.
+        bake_rope_for_trt(wrapper, H, W)
+
     dummy_A = torch.randn(1, 3, H, W)
     dummy_B = torch.randn(1, 3, H, W)
 
@@ -199,7 +294,7 @@ def export(
     print(
         f"Exporting with setting='{setting}', input {H}x{W}, "
         f"opset={opset}, bidirectional={bidirectional}, "
-        f"include_precision={include_precision} ..."
+        f"include_precision={include_precision}, trt={trt} ..."
     )
 
     with torch.no_grad():
@@ -350,6 +445,9 @@ if __name__ == "__main__":
                         help="export both A->B and B->A dense warp/overlap outputs")
     parser.add_argument("--include-precision", action="store_true",
                         help="also export precision matrices used by RoMaV2.sample")
+    parser.add_argument("--trt", action="store_true",
+                        help="bake RoPE to constants so the graph is "
+                             "TensorRT-parseable (removes If/Range)")
     args = parser.parse_args()
 
     if args.validate:
@@ -366,4 +464,5 @@ if __name__ == "__main__":
             opset=args.opset,
             bidirectional=args.bidirectional,
             include_precision=args.include_precision,
+            trt=args.trt,
         )
