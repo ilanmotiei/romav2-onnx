@@ -1,37 +1,37 @@
-name: "romav2_sampler"
-backend: "python"
+name: "romav2_fast_sampler"
+backend: "romav2_fast_sampler"
 max_batch_size: 0
 
 input [
   {
     name: "warp_AB"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 2 ]
   },
   {
     name: "overlap_AB"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 1 ]
   },
   {
     name: "precision_AB"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 2, 2 ]
   },
   {
     name: "warp_BA"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 2 ]
   },
   {
     name: "overlap_BA"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 1 ]
   },
   {
     name: "precision_BA"
     data_type: TYPE_FP32
-    dims: [ -1, -1, -1, -1, -1 ]
+    dims: [ -1, -1, -1, 2, 2 ]
   },
   {
     name: "num_corresp"

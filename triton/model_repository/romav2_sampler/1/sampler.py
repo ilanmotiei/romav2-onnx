@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:  # pragma: no cover - Triton image is expected to include torch.
+    torch = None
+    F = None
+
 
 def normalized_grid(height: int, width: int) -> np.ndarray:
     xs = np.linspace(-1.0 + 1.0 / width, 1.0 - 1.0 / width, width, dtype=np.float32)
@@ -90,6 +97,166 @@ def kde(matches: np.ndarray, std: float = 0.1) -> np.ndarray:
     diff = matches[:, None, :] - matches[None, :, :]
     sq_dist = np.sum(diff * diff, axis=-1)
     return np.exp(-sq_dist / (2.0 * std * std)).sum(axis=-1).astype(np.float32)
+
+
+def normalized_grid_torch(height: int, width: int, *, device: torch.device) -> torch.Tensor:
+    xs = torch.linspace(
+        -1.0 + 1.0 / width,
+        1.0 - 1.0 / width,
+        width,
+        dtype=torch.float32,
+        device=device,
+    )
+    ys = torch.linspace(
+        -1.0 + 1.0 / height,
+        1.0 - 1.0 / height,
+        height,
+        dtype=torch.float32,
+        device=device,
+    )
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.stack((grid_x, grid_y), dim=-1)
+
+
+def bhwc_grid_sample_torch(
+    values: torch.Tensor,
+    grid: torch.Tensor,
+    *,
+    mode: str = "bilinear",
+    align_corners: bool | None = False,
+) -> torch.Tensor:
+    return F.grid_sample(
+        values.permute(0, 3, 1, 2),
+        grid,
+        mode=mode,
+        align_corners=align_corners,
+    ).permute(0, 2, 3, 1)
+
+
+def kde_torch(matches: torch.Tensor, std: float = 0.1) -> torch.Tensor:
+    return (-(torch.cdist(matches, matches) ** 2) / (2 * std**2)).exp().sum(dim=-1)
+
+
+def _torch_multinomial(
+    weights: torch.Tensor,
+    count: int,
+    *,
+    replacement: bool,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    if count <= 0 or weights.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=weights.device)
+    if not replacement:
+        count = min(count, weights.numel())
+    return torch.multinomial(weights, count, replacement=replacement, generator=generator)
+
+
+def sample_roma_outputs_torch(
+    *,
+    warp_ab: torch.Tensor,
+    overlap_ab: torch.Tensor,
+    precision_ab: torch.Tensor,
+    warp_ba: torch.Tensor | None,
+    overlap_ba: torch.Tensor | None,
+    precision_ba: torch.Tensor | None,
+    num_corresp: int,
+    seed: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch implementation of RoMaV2.sample() for Triton Python backend.
+
+    This keeps the dense tensors on CUDA when Triton passes GPU buffers through
+    DLPack. It intentionally mirrors the original RoMaV2.sample() data flow.
+    """
+    if torch is None or F is None:
+        raise RuntimeError("PyTorch is required for sample_roma_outputs_torch")
+    if num_corresp < 0:
+        raise ValueError("num_corresp must be non-negative")
+    generator = None
+    if seed >= 0:
+        generator = torch.Generator(device=warp_ab.device)
+        generator.manual_seed(seed)
+
+    warp = warp_ab[0].float()
+    confidence_ab = overlap_ab[0].reshape(-1).float()
+    precision_ab_0 = precision_ab[0].float()
+
+    height, width, _ = warp.shape
+    grid = normalized_grid_torch(height, width, device=warp.device)
+    matches_ab = torch.cat((grid, warp), dim=-1).reshape(-1, 4)
+
+    has_ba = warp_ba is not None and overlap_ba is not None and precision_ba is not None
+    if has_ba:
+        warp_ba_0 = warp_ba[0].float()
+        confidence_ba = overlap_ba[0].reshape(-1).float()
+        precision_ba_0 = precision_ba[0].float()
+
+        precision_a = bhwc_grid_sample_torch(
+            precision_ba_0[None].reshape(1, height, width, -1),
+            warp[None],
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(height, width, 2, 2)
+        precision_b = bhwc_grid_sample_torch(
+            precision_ab_0[None].reshape(1, height, width, -1),
+            warp_ba_0[None],
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(height, width, 2, 2)
+        precision_fwd = torch.stack((precision_a, precision_ab_0), dim=-3).reshape(
+            -1, 2, 2, 2
+        )
+        precision_bwd = torch.stack((precision_ba_0, precision_b), dim=-3).reshape(
+            -1, 2, 2, 2
+        )
+        precision = torch.cat((precision_fwd, precision_bwd), dim=0)
+
+        matches_ba = torch.cat((warp_ba_0, grid), dim=-1).reshape(-1, 4)
+        confidence = torch.cat((confidence_ab, confidence_ba), dim=0)
+        matches = torch.cat((matches_ab, matches_ba), dim=0)
+    else:
+        precision = precision_ab_0.reshape(-1, 2, 2)
+        confidence = confidence_ab.reshape(-1)
+        matches = matches_ab
+
+    confidence = confidence * matches.abs().amax(dim=-1).le(1 - 1 / height).float()
+
+    expansion_factor = 4
+    first_count = min(expansion_factor * num_corresp, confidence.numel())
+    corresp_inds = _torch_multinomial(
+        confidence,
+        first_count,
+        replacement=False,
+        generator=generator,
+    )
+
+    sampled_matches = matches[corresp_inds]
+    sampled_confidence = confidence[corresp_inds]
+    sampled_precision = precision[corresp_inds]
+
+    density = kde_torch(sampled_matches)
+    p = 1 / (density + 1)
+    p[density < 10] = 1e-7
+    final_count = min(num_corresp, sampled_confidence.numel())
+    balanced = _torch_multinomial(
+        p,
+        final_count,
+        replacement=False,
+        generator=generator,
+    )
+
+    final_precision = sampled_precision[balanced]
+    if has_ba:
+        precision_a_out = final_precision[:, 0]
+        precision_b_out = final_precision[:, 1]
+    else:
+        precision_a_out = final_precision[:, 0]
+        precision_b_out = final_precision[:, 1]
+    return (
+        sampled_matches[balanced].contiguous(),
+        sampled_confidence[balanced].contiguous(),
+        precision_a_out.contiguous(),
+        precision_b_out.contiguous(),
+    )
 
 
 def sample_roma_outputs(

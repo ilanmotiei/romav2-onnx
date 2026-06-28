@@ -1,0 +1,34 @@
+ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver:25.07-py3
+ARG TRITON_SDK_IMAGE=nvcr.io/nvidia/tritonserver:25.07-py3-sdk
+
+FROM ${TRITON_SDK_IMAGE} AS builder
+
+ARG TRITON_COMMON_REPO_TAG=r25.07
+ARG TRITON_CORE_REPO_TAG=r25.07
+ARG TRITON_BACKEND_REPO_TAG=r25.07
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+      ninja-build \
+      rapidjson-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/romav2_fast_sampler
+COPY backends/romav2_fast_sampler/ ./
+
+RUN cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/tritonserver \
+      -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
+      -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
+      -DTRITON_BACKEND_REPO_TAG=${TRITON_BACKEND_REPO_TAG} \
+    && cmake --build build --parallel \
+    && cmake --install build
+
+FROM ${TRITON_IMAGE}
+COPY --from=builder /opt/tritonserver/backends/romav2_fast_sampler \
+  /opt/tritonserver/backends/romav2_fast_sampler

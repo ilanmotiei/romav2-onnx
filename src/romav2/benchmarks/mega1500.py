@@ -13,7 +13,12 @@ logger = logging.getLogger(__name__)
 
 
 class Mega1500:
-    def __init__(self, data_root="data/megadepth") -> None:
+    def __init__(
+        self,
+        data_root="data/megadepth",
+        samples_per_pair: int = 5,
+        max_pairs_per_scene: int | None = None,
+    ) -> None:
         self.scene_names = [
             "0015_0.1_0.3.npz",
             "0015_0.3_0.5.npz",
@@ -26,6 +31,8 @@ class Mega1500:
             for scene in self.scene_names
         ]
         self.data_root = data_root
+        self.samples_per_pair = samples_per_pair
+        self.max_pairs_per_scene = max_pairs_per_scene
 
     def benchmark(self, model, model_name=None):
         data_root = self.data_root
@@ -37,7 +44,10 @@ class Mega1500:
             intrinsics = scene["intrinsics"]
             poses = scene["poses"]
             im_paths = scene["image_paths"]
-            pair_inds = range(len(pairs))
+            num_pairs = len(pairs)
+            if self.max_pairs_per_scene is not None:
+                num_pairs = min(num_pairs, self.max_pairs_per_scene)
+            pair_inds = range(num_pairs)
             for pairind in (pbar := tqdm(pair_inds, desc="Mega1500 eval")):
                 idx1, idx2 = pairs[pairind][0]
                 K1 = intrinsics[idx1].copy()
@@ -62,7 +72,7 @@ class Mega1500:
                     K1, K2 = K1.copy(), K2.copy()
                     K1[:2] = K1[:2] * scale1
                     K2[:2] = K2[:2] * scale2
-                for _ in range(5):
+                for _ in range(self.samples_per_pair):
                     matches, _, _, _ = model.sample(preds, 5_000)
                     kpts1, kpts2 = model.to_pixel_coordinates(matches, h1, w1, h2, w2)
                     kpts1, kpts2 = kpts1.cpu().numpy(), kpts2.cpu().numpy()
