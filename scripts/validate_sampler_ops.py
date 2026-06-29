@@ -1,4 +1,4 @@
-"""Validate NumPy sampler primitives against the RoMaV2 PyTorch primitives."""
+"""Validate sampler primitives against the RoMaV2 PyTorch primitives."""
 
 from __future__ import annotations
 
@@ -48,6 +48,36 @@ def main():
         .numpy()
     )
     np.testing.assert_allclose(np_kde, torch_kde, rtol=1e-4, atol=1e-4)
+
+    batch, height, width = 1, 16, 16
+    warp_ab = rng.uniform(-1, 1, size=(batch, height, width, 2)).astype(np.float32)
+    overlap_ab = rng.uniform(0, 1, size=(batch, height, width, 1)).astype(np.float32)
+    precision_ab = np.broadcast_to(
+        np.eye(2, dtype=np.float32),
+        (batch, height, width, 2, 2),
+    ).copy()
+    warp_ba = rng.uniform(-1, 1, size=(batch, height, width, 2)).astype(np.float32)
+    overlap_ba = rng.uniform(0, 1, size=(batch, height, width, 1)).astype(np.float32)
+    precision_ba = np.broadcast_to(
+        np.eye(2, dtype=np.float32),
+        (batch, height, width, 2, 2),
+    ).copy()
+    torch_out = sampler.sample_roma_outputs_torch(
+        warp_ab=torch.from_numpy(warp_ab),
+        overlap_ab=torch.from_numpy(overlap_ab),
+        precision_ab=torch.from_numpy(precision_ab),
+        warp_ba=torch.from_numpy(warp_ba),
+        overlap_ba=torch.from_numpy(overlap_ba),
+        precision_ba=torch.from_numpy(precision_ba),
+        num_corresp=32,
+        seed=7,
+    )
+    assert [tuple(value.shape) for value in torch_out] == [
+        (32, 4),
+        (32,),
+        (32, 2, 2),
+        (32, 2, 2),
+    ]
     print("Sampler primitive validation passed.")
 
 
