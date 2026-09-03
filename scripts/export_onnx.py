@@ -4,16 +4,29 @@ Usage:
     # Fast setting (512x512, unidirectional, no HR) — simplest graph:
     python scripts/export_onnx.py
 
+    # Precise setting (800 low-res + 1280 high-res stage, bidirectional):
+    python scripts/export_onnx.py --setting precise --output romav2_precise.onnx
+
     # Validate an already-exported model:
     python scripts/export_onnx.py --validate romav2_fast.onnx
+    python scripts/export_onnx.py --validate romav2_precise.onnx --setting precise
 
-Exported inputs  (float32, values in [0, 1]):
+Exported inputs (float32, values in [0, 1]) — turbo / fast / base:
     img_A  (B, 3, H, W)
     img_B  (B, 3, H, W)
 
-Exported outputs:
+Exported outputs — turbo / fast / base:
     warp_AB     (B, H, W, 2)   — dense warp in normalized coords [-1, 1]
     overlap_AB  (B, H, W, 1)   — overlap probability in [0, 1]
+
+Precise is two-stage and bidirectional, so it takes both resolutions
+(the antialiased bicubic resize RoMaV2.match() uses has no ONNX symbolic,
+so resizing stays on the client) and returns both directions plus the
+2x2 precision matrices.  All spatial outputs are at the high resolution:
+    inputs   img_A_lr, img_B_lr  (B, 3, 800, 800)
+             img_A_hr, img_B_hr  (B, 3, 1280, 1280)
+    outputs  warp_AB, overlap_AB, precision_AB      (B, 1280, 1280, 2 | 1 | 2x2)
+             warp_BA, overlap_BA, precision_BA
 """
 
 from __future__ import annotations
@@ -42,12 +55,22 @@ _CPU = torch.device("cpu")
 # ── Wrapper ──────────────────────────────────────────────────────────────────
 
 class RoMaV2OnnxWrapper(nn.Module):
-    """Thin wrapper that exposes a flat (warp_AB, overlap_AB) interface.
+    """Thin wrapper that exposes a flat tensor interface.
 
     The underlying RoMaV2.forward returns an OrderedDict with many
     intermediate tensors and potential None values, neither of which
     are valid ONNX outputs.  This wrapper extracts only the final
     outputs and returns them as a plain tuple.
+
+    Unidirectional settings (turbo / fast / base):
+        (img_A, img_B) -> (warp_AB, overlap_AB)
+    Bidirectional, two-stage settings (precise):
+        (img_A_lr, img_B_lr, img_A_hr, img_B_hr)
+            -> (warp_AB, overlap_AB, precision_AB,
+                warp_BA, overlap_BA, precision_BA)
+
+    The branch is chosen by the model's setting, which is fixed at trace
+    time, so the exported graph is straight-line either way.
     """
 
     def __init__(self, model: RoMaV2) -> None:
@@ -55,13 +78,56 @@ class RoMaV2OnnxWrapper(nn.Module):
         self.model = model
 
     def forward(
-        self, img_A: torch.Tensor, img_B: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        preds = self.model(img_A, img_B)
-        warp_AB = preds["warp_AB"]
-        confidence_AB = preds["confidence_AB"]
-        overlap_AB, _ = _map_confidence(confidence=confidence_AB, threshold=None)
-        return warp_AB, overlap_AB
+        self,
+        img_A_lr: torch.Tensor,
+        img_B_lr: torch.Tensor,
+        img_A_hr: torch.Tensor | None = None,
+        img_B_hr: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        preds = self.model(img_A_lr, img_B_lr, img_A_hr=img_A_hr, img_B_hr=img_B_hr)
+        # Use the setting's threshold so the graph matches RoMaV2.match().
+        # (None for turbo/fast/base/precise; 0.05 for the benchmark settings.)
+        threshold = self.model.threshold
+        overlap_AB, precision_AB = _map_confidence(
+            confidence=preds["confidence_AB"], threshold=threshold
+        )
+        if not self.model.bidirectional:
+            return preds["warp_AB"], overlap_AB
+        overlap_BA, precision_BA = _map_confidence(
+            confidence=preds["confidence_BA"], threshold=threshold
+        )
+        return (
+            preds["warp_AB"], overlap_AB, precision_AB,
+            preds["warp_BA"], overlap_BA, precision_BA,
+        )
+
+
+def io_spec(
+    wrapper: RoMaV2OnnxWrapper,
+) -> tuple[list[str], list[str], tuple[torch.Tensor, ...], dict[str, dict[int, str]]]:
+    """(input_names, output_names, dummy_inputs, dynamic_axes) for the wrapper's setting.
+
+    Dummy inputs are CPU tensors at the setting's pinned resolution(s); only the
+    batch axis is dynamic.
+    """
+    m = wrapper.model
+    H, W = m.H_lr, m.W_lr
+    if m.H_hr is None:
+        input_names = ["img_A", "img_B"]
+        dummies = (torch.randn(1, 3, H, W), torch.randn(1, 3, H, W))
+    else:
+        input_names = ["img_A_lr", "img_B_lr", "img_A_hr", "img_B_hr"]
+        dummies = (
+            torch.randn(1, 3, H, W), torch.randn(1, 3, H, W),
+            torch.randn(1, 3, m.H_hr, m.W_hr), torch.randn(1, 3, m.H_hr, m.W_hr),
+        )
+    if m.bidirectional:
+        output_names = ["warp_AB", "overlap_AB", "precision_AB",
+                        "warp_BA", "overlap_BA", "precision_BA"]
+    else:
+        output_names = ["warp_AB", "overlap_AB"]
+    dynamic_axes = {name: {0: "batch"} for name in input_names + output_names}
+    return input_names, output_names, dummies, dynamic_axes
 
 
 # ── Build ────────────────────────────────────────────────────────────────────
@@ -128,25 +194,23 @@ def export(
 
     # Input resolution is determined by the chosen setting.
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
-    dummy_A = torch.randn(1, 3, H, W)
-    dummy_B = torch.randn(1, 3, H, W)
 
-    print(f"Exporting with setting='{setting}', input {H}x{W}, opset={opset} ...")
+    input_names, output_names, dummies, dynamic_axes = io_spec(wrapper)
+
+    res = f"{H}x{W}" + (f" + {wrapper.model.H_hr}x{wrapper.model.W_hr} hr"
+                        if wrapper.model.H_hr is not None else "")
+    print(f"Exporting with setting='{setting}', input {res}, opset={opset}, "
+          f"inputs={input_names}, outputs={output_names} ...")
 
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
-            (dummy_A, dummy_B),
+            dummies,
             output_path,
-            input_names=["img_A", "img_B"],
-            output_names=["warp_AB", "overlap_AB"],
+            input_names=input_names,
+            output_names=output_names,
             # batch dimension is dynamic; H/W are static (baked into the graph).
-            dynamic_axes={
-                "img_A":       {0: "batch"},
-                "img_B":       {0: "batch"},
-                "warp_AB":     {0: "batch"},
-                "overlap_AB":  {0: "batch"},
-            },
+            dynamic_axes=dynamic_axes,
             opset_version=opset,
             do_constant_folding=True,
             # Use the classic JIT-trace exporter instead of Dynamo.
@@ -174,41 +238,27 @@ def validate(onnx_path: str, setting: str = "fast", atol: float = 2e-2) -> None:
     # MPS vs CPU float32 diverge by ~0.23 in warp coords for a 24-layer ViT.
     print(f"[1/5] Building PyTorch model on CPU (downloads weights on first run) ...")
     t0 = time.time()
-    # ← potential hang: downloading 1 GB weights from GitHub
-    if sys.gettrace() is not None: breakpoint()  # inspect `setting`
     wrapper = build_model(setting, force_cpu=True)
     print(f"      Done in {time.time() - t0:.1f}s  (model device: cpu)")
 
-    H, W = wrapper.model.H_lr, wrapper.model.W_lr
-    img_A = torch.rand(1, 3, H, W)
-    img_B = torch.rand(1, 3, H, W)
-    print(f"      Input resolution: {H}x{W}, dtype={img_A.dtype}, device={img_A.device}")
+    input_names, output_names, dummies, _ = io_spec(wrapper)
+    # Images are expected in [0, 1]; io_spec's randn dummies are only for tracing.
+    inputs = [torch.rand_like(d) for d in dummies]
+    print(f"      Inputs: " + ", ".join(f"{n}{tuple(x.shape)}" for n, x in zip(input_names, inputs)))
 
     # ── Step 2: PyTorch forward pass ─────────────────────────────────────────
     print(f"[2/5] Running PyTorch forward pass on CPU ...")
     t0 = time.time()
-    # ← potential hang: CPU inference of a large model is slow (~same wall time
-    #   as the ONNX CPU pass below; unavoidable for CPU-only comparison)
-    if sys.gettrace() is not None: breakpoint()  # inspect `wrapper` before the forward pass
     with torch.no_grad():
-        pt_warp, pt_overlap = wrapper(img_A, img_B)
-    pt_warp_np    = pt_warp.numpy()
-    pt_overlap_np = pt_overlap.numpy()
+        pt_outs = [o.numpy() for o in wrapper(*inputs)]
     print(f"      Done in {time.time() - t0:.1f}s")
-    print(f"      pt_warp:    shape={pt_warp_np.shape}, min={pt_warp_np.min():.4f}, max={pt_warp_np.max():.4f}")
-    print(f"      pt_overlap: shape={pt_overlap_np.shape}, min={pt_overlap_np.min():.4f}, max={pt_overlap_np.max():.4f}")
-
-    # Inputs are already on CPU — just convert to numpy for ORT.
-    img_A_np = img_A.numpy()
-    img_B_np = img_B.numpy()
+    for name, arr in zip(output_names, pt_outs):
+        print(f"      pt {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}")
 
     # ── Step 3: load ONNX session ─────────────────────────────────────────────
     print(f"[3/5] Loading ONNX model from {onnx_path} ...")
     t0 = time.time()
-    # ← potential hang: constant-folding on a large graph can be slow
-    if sys.gettrace() is not None: breakpoint()  # inspect graph before ORT loads it
     sess_opts = ort.SessionOptions()
-    sess_opts.log_severity_level = 0       # verbose ORT logs
     sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     sess = ort.InferenceSession(
         onnx_path,
@@ -216,33 +266,32 @@ def validate(onnx_path: str, setting: str = "fast", atol: float = 2e-2) -> None:
         providers=["CPUExecutionProvider"],
     )
     print(f"      Done in {time.time() - t0:.1f}s")
-    print(f"      ORT inputs:  {[i.name for i in sess.get_inputs()]}")
-    print(f"      ORT outputs: {[o.name for o in sess.get_outputs()]}")
+    ort_in = [i.name for i in sess.get_inputs()]
+    ort_out = [o.name for o in sess.get_outputs()]
+    print(f"      ORT inputs:  {ort_in}")
+    print(f"      ORT outputs: {ort_out}")
+    if ort_in != input_names or ort_out != output_names:
+        raise SystemExit(
+            f"ONNX model IO {ort_in} -> {ort_out} does not match setting "
+            f"'{setting}' ({input_names} -> {output_names}); wrong --setting?"
+        )
 
     # ── Step 4: ONNX inference ────────────────────────────────────────────────
     print("[4/5] Running ONNX inference (CPU) ...")
     t0 = time.time()
-    # ← potential hang: CPU inference of a large model is slow (~same wall time
-    #   as the PyTorch CPU pass above; unavoidable for ONNX runtime on CPU)
-    if sys.gettrace() is not None: breakpoint()  # inspect `sess` and inputs before inference
-    onnx_warp, onnx_overlap = sess.run(
-        None, {"img_A": img_A_np, "img_B": img_B_np}
-    )
+    onnx_outs = sess.run(None, {n: x.numpy() for n, x in zip(input_names, inputs)})
     print(f"      Done in {time.time() - t0:.1f}s")
-    print(f"      onnx_warp:    shape={onnx_warp.shape}, min={onnx_warp.min():.4f}, max={onnx_warp.max():.4f}")
-    print(f"      onnx_overlap: shape={onnx_overlap.shape}, min={onnx_overlap.min():.4f}, max={onnx_overlap.max():.4f}")
+    for name, arr in zip(output_names, onnx_outs):
+        print(f"      onnx {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}")
 
     # ── Step 5: compare outputs ───────────────────────────────────────────────
     print(f"[5/5] Comparing outputs (atol={atol}) ...")
-    if sys.gettrace() is not None: breakpoint()  # inspect pt_warp_np / onnx_warp before assert_allclose
-    np.testing.assert_allclose(
-        pt_warp_np, onnx_warp, rtol=1e-3, atol=atol,
-        err_msg="warp_AB mismatch between PyTorch and ONNX"
-    )
-    np.testing.assert_allclose(
-        pt_overlap_np, onnx_overlap, rtol=1e-3, atol=atol,
-        err_msg="overlap_AB mismatch between PyTorch and ONNX"
-    )
+    for name, pt_arr, onnx_arr in zip(output_names, pt_outs, onnx_outs):
+        print(f"      {name}: max|diff|={np.abs(pt_arr - onnx_arr).max():.5f}")
+        np.testing.assert_allclose(
+            pt_arr, onnx_arr, rtol=1e-3, atol=atol,
+            err_msg=f"{name} mismatch between PyTorch and ONNX"
+        )
     print("Validation passed — PyTorch and ONNX outputs match.")
 
 
@@ -255,7 +304,7 @@ if __name__ == "__main__":
     parser.add_argument("--output",   default="romav2_fast.onnx",
                         help="output .onnx path")
     parser.add_argument("--setting",  default="fast",
-                        choices=["turbo", "fast", "base"],
+                        choices=["turbo", "fast", "base", "precise"],
                         help="model setting (determines input resolution)")
     parser.add_argument("--opset",    type=int, default=17,
                         help="ONNX opset version")

@@ -35,3 +35,6 @@ Thumbs.db
 *_result.png
 !assets/match_result.png
 !assets/triton_result.png
+
+# Benchmark outputs (scripts/benchmark.py default --out-dir)
+bench/
