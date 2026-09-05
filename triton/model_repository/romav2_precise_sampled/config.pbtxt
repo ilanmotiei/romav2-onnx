@@ -1,17 +1,30 @@
-name: "romav2_bidirectional_sampled"
+name: "romav2_precise_sampled"
 platform: "ensemble"
 max_batch_size: 0
+# RoMaV2 precise (800 lr + 1280 hr) dense matcher followed by the shared romav2_sampler:
+# same pipeline as romav2_bidirectional_sampled, only the image inputs differ. All dense
+# tensors handed to the sampler are 1280x1280.
 
 input [
   {
-    name: "img_A"
+    name: "img_A_lr"
     data_type: TYPE_FP32
-    dims: [ -1, 3, 640, 640 ]
+    dims: [ -1, 3, 800, 800 ]
   },
   {
-    name: "img_B"
+    name: "img_B_lr"
     data_type: TYPE_FP32
-    dims: [ -1, 3, 640, 640 ]
+    dims: [ -1, 3, 800, 800 ]
+  },
+  {
+    name: "img_A_hr"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 1280, 1280 ]
+  },
+  {
+    name: "img_B_hr"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 1280, 1280 ]
   },
   {
     name: "num_corresp"
@@ -51,15 +64,23 @@ output [
 ensemble_scheduling {
   step [
     {
-      model_name: "romav2_bidirectional_dense"
+      model_name: "romav2_precise_dense"
       model_version: -1
       input_map {
-        key: "img_A"
-        value: "img_A"
+        key: "img_A_lr"
+        value: "img_A_lr"
       }
       input_map {
-        key: "img_B"
-        value: "img_B"
+        key: "img_B_lr"
+        value: "img_B_lr"
+      }
+      input_map {
+        key: "img_A_hr"
+        value: "img_A_hr"
+      }
+      input_map {
+        key: "img_B_hr"
+        value: "img_B_hr"
       }
       output_map {
         key: "warp_AB"

@@ -1,0 +1,90 @@
+name: "romav2_precise_dense"
+platform: "onnxruntime_onnx"
+max_batch_size: 0
+
+# RoMaV2 "precise" setting: an 800x800 low-res pass (DINOv3 + matcher + refiners) followed by
+# a 1280x1280 refinement stage, bidirectional. The antialiased bicubic resize RoMaV2.match()
+# applies has no ONNX symbolic, so the CLIENT resizes the same source image to both sizes
+# (romav2-onnx: scripts/visualize.py prepare()) and sends all four tensors. Every output is
+# at the high resolution (1280x1280). Exported with
+#   python scripts/export_onnx.py --setting precise
+# (bidirectional + precision outputs are implied by the setting).
+input [
+  {
+    name: "img_A_lr"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 800, 800 ]
+  },
+  {
+    name: "img_B_lr"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 800, 800 ]
+  },
+  {
+    name: "img_A_hr"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 1280, 1280 ]
+  },
+  {
+    name: "img_B_hr"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 1280, 1280 ]
+  }
+]
+
+output [
+  {
+    name: "warp_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, 2 ]
+  },
+  {
+    name: "overlap_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, 1 ]
+  },
+  {
+    name: "precision_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1, -1 ]
+  },
+  {
+    name: "warp_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, 2 ]
+  },
+  {
+    name: "overlap_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, 1 ]
+  },
+  {
+    name: "precision_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1, -1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+
+# Same arena policy as romav2_bidirectional_dense, and more important here: the 1280x1280
+# stage's local-correlation window tensor alone is ~3.9 GB per direction, so the default
+# power-of-two arena growth would grab far more of the shared 3090 than the graph needs.
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator : [ {
+      name : "cuda"
+      parameters { key: "arena_extend_strategy" value: "kSameAsRequested" }
+    } ]
+  }
+}
+
+# Release the activation arena between runs so SAM3 / the other romav2 model get the GPU
+# back (they never inference concurrently). See sam3_unified_encoder for the rationale.
+parameters { key: "memory.enable_memory_arena_shrinkage" value: { string_value: "gpu:0" } }
+parameters { key: "session.use_device_allocator_for_initializers" value: { string_value: "1" } }

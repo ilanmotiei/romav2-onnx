@@ -71,6 +71,15 @@ output [
 instance_group [
   {
     count: 1
-    kind: KIND_CPU
+    kind: KIND_GPU
   }
 ]
+
+# Hand the dense warp/overlap/precision tensors to the backend as CUDA buffers instead of
+# force-copying them to host RAM (the Python backend's default). model.py adopts them
+# zero-copy via DLPack into CuPy; without this the GPU path would pay a D2H + H2D round
+# trip on every request and lose most of what it gains.
+parameters: {
+  key: "FORCE_CPU_ONLY_INPUT_TENSORS"
+  value: { string_value: "no" }
+}
