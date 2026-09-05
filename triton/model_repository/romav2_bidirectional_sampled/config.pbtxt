@@ -1,0 +1,142 @@
+name: "romav2_bidirectional_sampled"
+platform: "ensemble"
+max_batch_size: 0
+
+input [
+  {
+    name: "img_A"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 512, 512 ]
+  },
+  {
+    name: "img_B"
+    data_type: TYPE_FP32
+    dims: [ -1, 3, 512, 512 ]
+  },
+  {
+    name: "num_corresp"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "seed"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "sampled_matches"
+    data_type: TYPE_FP32
+    dims: [ -1, 4 ]
+  },
+  {
+    name: "sampled_confidence"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "sampled_precision_A"
+    data_type: TYPE_FP32
+    dims: [ -1, 2, 2 ]
+  },
+  {
+    name: "sampled_precision_B"
+    data_type: TYPE_FP32
+    dims: [ -1, 2, 2 ]
+  }
+]
+
+ensemble_scheduling {
+  step [
+    {
+      model_name: "romav2_bidirectional_dense"
+      model_version: -1
+      input_map {
+        key: "img_A"
+        value: "img_A"
+      }
+      input_map {
+        key: "img_B"
+        value: "img_B"
+      }
+      output_map {
+        key: "warp_AB"
+        value: "dense_warp_AB"
+      }
+      output_map {
+        key: "overlap_AB"
+        value: "dense_overlap_AB"
+      }
+      output_map {
+        key: "precision_AB"
+        value: "dense_precision_AB"
+      }
+      output_map {
+        key: "warp_BA"
+        value: "dense_warp_BA"
+      }
+      output_map {
+        key: "overlap_BA"
+        value: "dense_overlap_BA"
+      }
+      output_map {
+        key: "precision_BA"
+        value: "dense_precision_BA"
+      }
+    },
+    {
+      model_name: "romav2_sampler"
+      model_version: -1
+      input_map {
+        key: "warp_AB"
+        value: "dense_warp_AB"
+      }
+      input_map {
+        key: "overlap_AB"
+        value: "dense_overlap_AB"
+      }
+      input_map {
+        key: "precision_AB"
+        value: "dense_precision_AB"
+      }
+      input_map {
+        key: "warp_BA"
+        value: "dense_warp_BA"
+      }
+      input_map {
+        key: "overlap_BA"
+        value: "dense_overlap_BA"
+      }
+      input_map {
+        key: "precision_BA"
+        value: "dense_precision_BA"
+      }
+      input_map {
+        key: "num_corresp"
+        value: "num_corresp"
+      }
+      input_map {
+        key: "seed"
+        value: "seed"
+      }
+      output_map {
+        key: "sampled_matches"
+        value: "sampled_matches"
+      }
+      output_map {
+        key: "sampled_confidence"
+        value: "sampled_confidence"
+      }
+      output_map {
+        key: "sampled_precision_A"
+        value: "sampled_precision_A"
+      }
+      output_map {
+        key: "sampled_precision_B"
+        value: "sampled_precision_B"
+      }
+    }
+  ]
+}

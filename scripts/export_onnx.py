@@ -1,28 +1,44 @@
 """Export RoMaV2 to ONNX.
 
 Usage:
-    # Fast setting (512x512, unidirectional, no HR) — simplest graph:
+    # Fast setting (512x512, unidirectional, no HR) - simplest graph:
     python scripts/export_onnx.py
 
-    # Precise setting (800 low-res + 1280 high-res stage, bidirectional):
+    # Fast setting with both A->B and B->A outputs:
+    python scripts/export_onnx.py --bidirectional --output romav2_fast_bidir.onnx
+
+    # TensorRT-ready (bakes RoPE -> no If/Range so TensorRT can parse the graph;
+    # composes with --bidirectional for the dense/bidir model):
+    python scripts/export_onnx.py --trt --output romav2_fast_trt.onnx
+
+    # Precise setting (800 low-res + 1280 high-res stage; bidirectional and
+    # precision outputs are implied by the setting):
     python scripts/export_onnx.py --setting precise --output romav2_precise.onnx
 
-    # Validate an already-exported model:
+    # Validate an already-exported model (pass the same flags used to export it):
     python scripts/export_onnx.py --validate romav2_fast.onnx
     python scripts/export_onnx.py --validate romav2_precise.onnx --setting precise
 
-Exported inputs (float32, values in [0, 1]) — turbo / fast / base:
+Exported inputs (float32, values in [0, 1]) - turbo / fast / base:
     img_A  (B, 3, H, W)
     img_B  (B, 3, H, W)
 
-Exported outputs — turbo / fast / base:
+Exported outputs:
     warp_AB     (B, H, W, 2)   — dense warp in normalized coords [-1, 1]
     overlap_AB  (B, H, W, 1)   — overlap probability in [0, 1]
 
-Precise is two-stage and bidirectional, so it takes both resolutions
-(the antialiased bicubic resize RoMaV2.match() uses has no ONNX symbolic,
-so resizing stays on the client) and returns both directions plus the
-2x2 precision matrices.  All spatial outputs are at the high resolution:
+With --bidirectional, the export also includes:
+    warp_BA     (B, H, W, 2)
+    overlap_BA  (B, H, W, 1)
+
+With --include-precision, the export also includes:
+    precision_AB  (B, H, W, 2, 2)
+    precision_BA  (B, H, W, 2, 2)  # when combined with --bidirectional
+
+Two-stage settings (precise) take both resolutions — the antialiased bicubic
+resize RoMaV2.match() applies has no ONNX symbolic, so resizing stays on the
+client — and always export both directions plus precision.  All spatial
+outputs are at the high resolution:
     inputs   img_A_lr, img_B_lr  (B, 3, 800, 800)
              img_A_hr, img_B_hr  (B, 3, 1280, 1280)
     outputs  warp_AB, overlap_AB, precision_AB      (B, 1280, 1280, 2 | 1 | 2x2)
@@ -33,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -55,27 +72,35 @@ _CPU = torch.device("cpu")
 # ── Wrapper ──────────────────────────────────────────────────────────────────
 
 class RoMaV2OnnxWrapper(nn.Module):
-    """Thin wrapper that exposes a flat tensor interface.
+    """Thin wrapper that exposes a flat ONNX-friendly interface.
 
     The underlying RoMaV2.forward returns an OrderedDict with many
     intermediate tensors and potential None values, neither of which
     are valid ONNX outputs.  This wrapper extracts only the final
     outputs and returns them as a plain tuple.
 
-    Unidirectional settings (turbo / fast / base):
-        (img_A, img_B) -> (warp_AB, overlap_AB)
-    Bidirectional, two-stage settings (precise):
-        (img_A_lr, img_B_lr, img_A_hr, img_B_hr)
-            -> (warp_AB, overlap_AB, precision_AB,
-                warp_BA, overlap_BA, precision_BA)
-
-    The branch is chosen by the model's setting, which is fixed at trace
-    time, so the exported graph is straight-line either way.
+    Inputs follow the model's setting: (img_A, img_B) for single-stage
+    settings, (img_A_lr, img_B_lr, img_A_hr, img_B_hr) for two-stage ones
+    (precise).  Outputs are warp_AB, overlap_AB[, precision_AB] and, when
+    bidirectional, warp_BA, overlap_BA[, precision_BA].  Both choices are
+    fixed at trace time, so the exported graph is straight-line either way.
     """
 
-    def __init__(self, model: RoMaV2) -> None:
+    def __init__(
+        self,
+        model: RoMaV2,
+        *,
+        bidirectional_outputs: bool = False,
+        precision_outputs: bool = False,
+    ) -> None:
         super().__init__()
         self.model = model
+        self.bidirectional_outputs = bidirectional_outputs
+        self.precision_outputs = precision_outputs
+
+    @property
+    def two_stage(self) -> bool:
+        return self.model.H_hr is not None
 
     def forward(
         self,
@@ -88,31 +113,40 @@ class RoMaV2OnnxWrapper(nn.Module):
         # Use the setting's threshold so the graph matches RoMaV2.match().
         # (None for turbo/fast/base/precise; 0.05 for the benchmark settings.)
         threshold = self.model.threshold
+        warp_AB = preds["warp_AB"]
         overlap_AB, precision_AB = _map_confidence(
             confidence=preds["confidence_AB"], threshold=threshold
         )
-        if not self.model.bidirectional:
-            return preds["warp_AB"], overlap_AB
+        if not self.bidirectional_outputs:
+            if self.precision_outputs:
+                return warp_AB, overlap_AB, precision_AB
+            return warp_AB, overlap_AB
+
+        warp_BA = preds["warp_BA"]
+        confidence_BA = preds["confidence_BA"]
+        if warp_BA is None or confidence_BA is None:
+            raise RuntimeError(
+                "Bidirectional export requested, but model did not produce B->A outputs"
+            )
         overlap_BA, precision_BA = _map_confidence(
-            confidence=preds["confidence_BA"], threshold=threshold
+            confidence=confidence_BA, threshold=threshold
         )
-        return (
-            preds["warp_AB"], overlap_AB, precision_AB,
-            preds["warp_BA"], overlap_BA, precision_BA,
-        )
+        if self.precision_outputs:
+            return warp_AB, overlap_AB, precision_AB, warp_BA, overlap_BA, precision_BA
+        return warp_AB, overlap_AB, warp_BA, overlap_BA
 
 
 def io_spec(
     wrapper: RoMaV2OnnxWrapper,
 ) -> tuple[list[str], list[str], tuple[torch.Tensor, ...], dict[str, dict[int, str]]]:
-    """(input_names, output_names, dummy_inputs, dynamic_axes) for the wrapper's setting.
+    """(input_names, output_names, dummy_inputs, dynamic_axes) for a wrapper.
 
     Dummy inputs are CPU tensors at the setting's pinned resolution(s); only the
     batch axis is dynamic.
     """
     m = wrapper.model
     H, W = m.H_lr, m.W_lr
-    if m.H_hr is None:
+    if not wrapper.two_stage:
         input_names = ["img_A", "img_B"]
         dummies = (torch.randn(1, 3, H, W), torch.randn(1, 3, H, W))
     else:
@@ -121,11 +155,13 @@ def io_spec(
             torch.randn(1, 3, H, W), torch.randn(1, 3, H, W),
             torch.randn(1, 3, m.H_hr, m.W_hr), torch.randn(1, 3, m.H_hr, m.W_hr),
         )
-    if m.bidirectional:
-        output_names = ["warp_AB", "overlap_AB", "precision_AB",
-                        "warp_BA", "overlap_BA", "precision_BA"]
-    else:
-        output_names = ["warp_AB", "overlap_AB"]
+    output_names = ["warp_AB", "overlap_AB"]
+    if wrapper.precision_outputs:
+        output_names.append("precision_AB")
+    if wrapper.bidirectional_outputs:
+        output_names.extend(["warp_BA", "overlap_BA"])
+        if wrapper.precision_outputs:
+            output_names.append("precision_BA")
     dynamic_axes = {name: {0: "batch"} for name in input_names + output_names}
     return input_names, output_names, dummies, dynamic_axes
 
@@ -141,7 +177,13 @@ def _native_device() -> torch.device:
     return torch.device("cpu")
 
 
-def build_model(setting: str = "fast", *, force_cpu: bool = True) -> RoMaV2OnnxWrapper:
+def build_model(
+    setting: str = "fast",
+    *,
+    force_cpu: bool = True,
+    bidirectional: bool = False,
+    include_precision: bool = False,
+) -> RoMaV2OnnxWrapper:
     """Build the model wrapper.
 
     force_cpu=True  → patches all romav2 module device bindings to CPU and
@@ -149,6 +191,11 @@ def build_model(setting: str = "fast", *, force_cpu: bool = True) -> RoMaV2OnnxW
     force_cpu=False → leaves the model on the native device (CUDA/MPS/CPU).
                       Use this for the PyTorch reference pass during validation
                       so that the accelerator is utilised and it does not stall.
+
+    bidirectional / include_precision add the B->A and precision outputs on
+    top of the setting.  Two-stage settings (precise) are bidirectional by
+    construction and always export precision, since that is the interface
+    the Triton sampler consumes.
     """
     torch.set_float32_matmul_precision("highest")
 
@@ -174,13 +221,106 @@ def build_model(setting: str = "fast", *, force_cpu: bool = True) -> RoMaV2OnnxW
         setting=setting,
     )
     model = RoMaV2(cfg)
+    if bidirectional:
+        model.bidirectional = True
+    two_stage = model.H_hr is not None
 
     model.to(target_dev).float()
 
     model.eval()
-    wrapper = RoMaV2OnnxWrapper(model)
+    wrapper = RoMaV2OnnxWrapper(
+        model,
+        bidirectional_outputs=model.bidirectional,
+        precision_outputs=include_precision or two_stage,
+    )
     wrapper.eval()
     return wrapper
+
+
+# ── TensorRT prep: bake RoPE to constants ─────────────────────────────────────
+
+def bake_rope_for_trt(wrapper: RoMaV2OnnxWrapper, H: int, W: int) -> int:
+    """Replace every RopePositionEmbedding.forward with a constant lookup.
+
+    Why: RoMaV2's DINOv3 RoPE (src/romav2/vit/rope.py) computes sin/cos from the
+    patch-grid (H, W) via ``torch.arange(...)`` + ``angles.tile(2)``.  The tracer
+    emits these as a ``Range`` and an ``If`` with no static shape, and TensorRT's
+    ONNX parser rejects the ``If`` ("has no shape specified"), so TRT cannot
+    capture the backbone (whether via standalone trtexec or ONNX Runtime's
+    TensorRT execution provider).
+
+    The export pins the image resolution (dynamic_axes only covers batch), so the
+    patch-grid (H, W) — and therefore sin/cos — is constant.  We run one dry
+    forward to capture each RoPE module's (sin, cos) output, register them as
+    buffers, and swap in a ``forward`` that just returns them.  Result: no
+    Range/If, so TensorRT can parse the backbone — build the engine offline with
+    trtexec (recommended for this ~1.4GB model) or via ORT's TensorRT EP.
+
+    Numerically a no-op for the deployed fixed-resolution graph: RoPE output
+    depends only on (H, W), never on image content.  GridSample and any other op
+    TRT doesn't support fall back gracefully — no graph surgery needed.
+
+    Composes with --bidirectional/--include-precision and with two-stage
+    settings: it walks the same module tree regardless of how many inputs or
+    outputs the wrapper exposes.  RoPE only runs on the low-res pass (the
+    high-res stage is VGG-only), so a two-stage export still has one grid.
+
+    Returns the number of RoPE modules baked.
+    """
+    # Match by class name, NOT isinstance: the matcher uses
+    # romav2.vit.rope.RopePositionEmbedding, but the DINOv3 descriptor backbone
+    # (loaded from torch.hub) carries its OWN dinov3.layers...RopePositionEmbedding
+    # — identical code, different class object. Both emit the Range/Tile/If we must
+    # bake, so we can't filter on a single imported class.
+    rope_mods = [m for m in wrapper.modules()
+                 if type(m).__name__ == "RopePositionEmbedding"]
+    if not rope_mods:
+        raise RuntimeError("No RopePositionEmbedding modules found — nothing to bake.")
+
+    captured: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    seen_hw: dict[int, tuple[int, int]] = {}
+
+    def _make_hook(mod):
+        def _hook(module, args, kwargs, output):
+            hw = (int(kwargs["H"]), int(kwargs["W"]))
+            if id(mod) in seen_hw and seen_hw[id(mod)] != hw:
+                # A single module exercised at two resolutions can't be baked to
+                # one constant — would only happen if the export stopped pinning
+                # H/W. Fail loud rather than silently bake the wrong grid.
+                raise RuntimeError(
+                    f"RoPE module called at {hw} and {seen_hw[id(mod)]}; "
+                    "cannot bake a constant. Keep the export resolution fixed."
+                )
+            seen_hw[id(mod)] = hw
+            captured[id(mod)] = (output[0].detach().clone(), output[1].detach().clone())
+        return _hook
+
+    handles = [m.register_forward_hook(_make_hook(m), with_kwargs=True) for m in rope_mods]
+    try:
+        with torch.no_grad():
+            wrapper(*io_spec(wrapper)[2])
+    finally:
+        for h in handles:
+            h.remove()
+
+    for m in rope_mods:
+        if id(m) not in captured:
+            raise RuntimeError(
+                "A RoPE module was not exercised by the dry forward; cannot bake it."
+            )
+        sin, cos = captured[id(m)]
+        m.register_buffer("_trt_sin", sin, persistent=False)
+        m.register_buffer("_trt_cos", cos, persistent=False)
+
+        def _const_forward(self, *, H, W):  # noqa: N803 — match the original signature
+            return (self._trt_sin, self._trt_cos)
+
+        m.forward = types.MethodType(_const_forward, m)
+
+    grids = {hw for hw in seen_hw.values()}
+    print(f"Baked RoPE for {len(rope_mods)} module(s) at patch grid(s) {sorted(grids)} "
+          f"(image {H}x{W}) → no Range/If, backbone is TRT-parseable.")
+    return len(rope_mods)
 
 
 # ── Export ───────────────────────────────────────────────────────────────────
@@ -189,18 +329,33 @@ def export(
     output_path: str = "romav2_fast.onnx",
     setting: str = "fast",
     opset: int = 17,
+    bidirectional: bool = False,
+    include_precision: bool = False,
+    trt: bool = False,
 ) -> None:
-    wrapper = build_model(setting)
+    wrapper = build_model(
+        setting,
+        bidirectional=bidirectional,
+        include_precision=include_precision,
+    )
 
     # Input resolution is determined by the chosen setting.
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
 
+    if trt:
+        # Make the graph TensorRT-parseable so TRT can capture the backbone.
+        bake_rope_for_trt(wrapper, H, W)
+
     input_names, output_names, dummies, dynamic_axes = io_spec(wrapper)
 
     res = f"{H}x{W}" + (f" + {wrapper.model.H_hr}x{wrapper.model.W_hr} hr"
-                        if wrapper.model.H_hr is not None else "")
-    print(f"Exporting with setting='{setting}', input {res}, opset={opset}, "
-          f"inputs={input_names}, outputs={output_names} ...")
+                        if wrapper.two_stage else "")
+    print(
+        f"Exporting with setting='{setting}', input {res}, opset={opset}, "
+        f"bidirectional={wrapper.bidirectional_outputs}, "
+        f"include_precision={wrapper.precision_outputs}, trt={trt}\n"
+        f"    inputs={input_names}\n    outputs={output_names} ..."
+    )
 
     with torch.no_grad():
         torch.onnx.export(
@@ -224,7 +379,13 @@ def export(
 
 # ── Validate ─────────────────────────────────────────────────────────────────
 
-def validate(onnx_path: str, setting: str = "fast", atol: float = 2e-2) -> None:
+def validate(
+    onnx_path: str,
+    setting: str = "fast",
+    atol: float = 2e-2,
+    bidirectional: bool = False,
+    include_precision: bool = False,
+) -> None:
     import time
 
     try:
@@ -238,7 +399,12 @@ def validate(onnx_path: str, setting: str = "fast", atol: float = 2e-2) -> None:
     # MPS vs CPU float32 diverge by ~0.23 in warp coords for a 24-layer ViT.
     print(f"[1/5] Building PyTorch model on CPU (downloads weights on first run) ...")
     t0 = time.time()
-    wrapper = build_model(setting, force_cpu=True)
+    wrapper = build_model(
+        setting,
+        force_cpu=True,
+        bidirectional=bidirectional,
+        include_precision=include_precision,
+    )
     print(f"      Done in {time.time() - t0:.1f}s  (model device: cpu)")
 
     input_names, output_names, dummies, _ = io_spec(wrapper)
@@ -272,8 +438,9 @@ def validate(onnx_path: str, setting: str = "fast", atol: float = 2e-2) -> None:
     print(f"      ORT outputs: {ort_out}")
     if ort_in != input_names or ort_out != output_names:
         raise SystemExit(
-            f"ONNX model IO {ort_in} -> {ort_out} does not match setting "
-            f"'{setting}' ({input_names} -> {output_names}); wrong --setting?"
+            f"ONNX model IO {ort_in} -> {ort_out} does not match the requested "
+            f"configuration ({input_names} -> {output_names}); pass the same "
+            "--setting / --bidirectional / --include-precision used at export."
         )
 
     # ── Step 4: ONNX inference ────────────────────────────────────────────────
@@ -305,12 +472,32 @@ if __name__ == "__main__":
                         help="output .onnx path")
     parser.add_argument("--setting",  default="fast",
                         choices=["turbo", "fast", "base", "precise"],
-                        help="model setting (determines input resolution)")
+                        help="model setting (determines input resolution; precise "
+                             "is two-stage, bidirectional and exports precision)")
     parser.add_argument("--opset",    type=int, default=17,
                         help="ONNX opset version")
+    parser.add_argument("--bidirectional", action="store_true",
+                        help="export both A->B and B->A dense warp/overlap outputs")
+    parser.add_argument("--include-precision", action="store_true",
+                        help="also export precision matrices used by RoMaV2.sample")
+    parser.add_argument("--trt", action="store_true",
+                        help="bake RoPE to constants so the graph is "
+                             "TensorRT-parseable (removes If/Range)")
     args = parser.parse_args()
 
     if args.validate:
-        validate(args.validate, setting=args.setting)
+        validate(
+            args.validate,
+            setting=args.setting,
+            bidirectional=args.bidirectional,
+            include_precision=args.include_precision,
+        )
     else:
-        export(args.output, setting=args.setting, opset=args.opset)
+        export(
+            args.output,
+            setting=args.setting,
+            opset=args.opset,
+            bidirectional=args.bidirectional,
+            include_precision=args.include_precision,
+            trt=args.trt,
+        )

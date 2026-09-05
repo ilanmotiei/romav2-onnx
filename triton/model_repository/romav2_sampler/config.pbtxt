@@ -1,0 +1,76 @@
+name: "romav2_sampler"
+backend: "python"
+max_batch_size: 0
+
+input [
+  {
+    name: "warp_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "overlap_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "precision_AB"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1, -1 ]
+  },
+  {
+    name: "warp_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "overlap_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1 ]
+  },
+  {
+    name: "precision_BA"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, -1, -1, -1 ]
+  },
+  {
+    name: "num_corresp"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "seed"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "sampled_matches"
+    data_type: TYPE_FP32
+    dims: [ -1, 4 ]
+  },
+  {
+    name: "sampled_confidence"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "sampled_precision_A"
+    data_type: TYPE_FP32
+    dims: [ -1, 2, 2 ]
+  },
+  {
+    name: "sampled_precision_B"
+    data_type: TYPE_FP32
+    dims: [ -1, 2, 2 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]

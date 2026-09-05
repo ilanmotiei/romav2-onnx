@@ -54,6 +54,12 @@ The modified `romav2` source is embedded directly in `src/` — no separate clon
 # Fast setting (512×512 input, ~350 MB model)
 python scripts/export_onnx.py --output romav2_fast.onnx --setting fast
 
+# Fast setting with both A→B and B→A dense outputs
+python scripts/export_onnx.py \
+    --output romav2_fast_bidir.onnx \
+    --setting fast \
+    --bidirectional
+
 # Base setting (640×640)
 python scripts/export_onnx.py --output romav2_base.onnx --setting base
 ```
@@ -62,7 +68,7 @@ Available settings:
 
 | Setting | Input size | Notes |
 |---------|-----------|-------|
-| `turbo` | 256×256 | Fastest, least accurate |
+| `turbo` | 320×320 | Fastest, least accurate |
 | `fast`  | 512×512 | Good balance |
 | `base`  | 640×640 | Higher accuracy |
 
@@ -75,6 +81,18 @@ The script:
 **Inputs:** `img_A`, `img_B` — `float32 [B, 3, H, W]`, values in `[0, 1]`
 **Outputs:** `warp_AB` — `float32 [B, H, W, 2]` (normalised coords in `[-1, 1]`), `overlap_AB` — `float32 [B, H, W, 1]` (probability in `[0, 1]`)
 
+Add `--bidirectional` to also export `warp_BA` and `overlap_BA` with the same shapes. This is slower because the matcher/refiners also compute the B→A direction, but it is useful when downstream sampling or geometry wants both directions.
+
+Add `--include-precision` for models that will feed the Triton sampled ensemble. This also exports `precision_AB` and, with `--bidirectional`, `precision_BA`, matching the precision matrices consumed by RoMaV2's `sample()` flow:
+
+```bash
+python scripts/export_onnx.py \
+    --output romav2_fast_bidir_precision.onnx \
+    --setting fast \
+    --bidirectional \
+    --include-precision
+```
+
 ---
 
 ## 2 — Validate
@@ -83,6 +101,12 @@ Runs both the PyTorch model and the exported ONNX model on identical CPU inputs 
 
 ```bash
 python scripts/export_onnx.py --validate romav2_fast.onnx --setting fast
+
+# Validate a bidirectional export
+python scripts/export_onnx.py \
+    --validate romav2_fast_bidir.onnx \
+    --setting fast \
+    --bidirectional
 ```
 
 Expected output:
@@ -108,6 +132,9 @@ Validation passed — PyTorch and ONNX outputs match.
 # Uses sample images included in this repo
 python scripts/visualize.py --onnx romav2_fast.onnx --out result.png
 
+# Bidirectional ONNX exports are detected automatically and produce both directions
+python scripts/visualize.py --onnx romav2_fast_bidir.onnx --out bidir_result.png
+
 # Or PyTorch model
 python scripts/visualize.py --out result.png
 
@@ -129,6 +156,10 @@ The output is a 6-panel composite (2×3 grid):
 |-------------|---------------|--------------|
 | Confidence heatmap | Alpha blend | Dense correspondences |
 
+For bidirectional ONNX exports, the image stacks two 6-panel composites: A→B first, then B→A.
+
+![bidirectional ONNX result](assets/bidir_onnx_result.png)
+
 ---
 
 ## 4 — Triton Inference Server
@@ -141,6 +172,27 @@ The `triton/model_repository/romav2/config.pbtxt` is already configured. You onl
 mkdir -p triton/model_repository/romav2/1
 cp romav2_fast.onnx triton/model_repository/romav2/1/model.onnx
 ```
+
+For a bidirectional export, use the separate config:
+
+```bash
+mkdir -p triton/model_repository/romav2_bidirectional/1
+cp romav2_fast_bidir.onnx triton/model_repository/romav2_bidirectional/1/model.onnx
+```
+
+To avoid returning dense `H×W×...` tensors over the network, use the sampled ensemble. It chains a precision-exported bidirectional ONNX model into `romav2_sampler`, a Triton Python backend implementation of RoMaV2's sampling flow:
+
+```bash
+mkdir -p triton/model_repository/romav2_bidirectional_dense/1
+cp romav2_fast_bidir_precision.onnx \
+  triton/model_repository/romav2_bidirectional_dense/1/model.onnx
+```
+
+Then call the user-facing ensemble model `romav2_bidirectional_sampled`, not the dense model. The dense tensors stay inside Triton.
+
+If you export `turbo` or `base`, update the `img_A`/`img_B` input dimensions in the relevant `config.pbtxt` to `320×320` or `640×640`.
+
+The checked-in Triton configs keep output dimensions fully dynamic for compatibility with `nvcr.io/nvidia/tritonserver:23.12-py3`. If a newer Triton version reports that the model expects concrete output dimensions, set warp outputs to `[ -1, -1, -1, 2 ]`, overlap outputs to `[ -1, -1, -1, 1 ]`, and precision outputs to `[ -1, -1, -1, 2, 2 ]` in that environment.
 
 ### 4.2 Start the server
 
@@ -167,6 +219,25 @@ python scripts/triton_client.py \
     assets/toronto_A.jpg assets/toronto_B.jpg \
     --url localhost:8000 \
     --out result.png
+```
+
+For the sampled ensemble:
+
+```bash
+python scripts/triton_sampled_client.py \
+    assets/toronto_A.jpg assets/toronto_B.jpg \
+    --url localhost:8000 \
+    --model romav2_bidirectional_sampled \
+    --num-corresp 5000
+```
+
+The sampled ensemble returns:
+
+```text
+sampled_matches      (N, 4)       # x_A, y_A, x_B, y_B in normalized coordinates
+sampled_confidence   (N,)
+sampled_precision_A  (N, 2, 2)
+sampled_precision_B  (N, 2, 2)
 ```
 
 ### 4.4 Use the client in Python
@@ -197,12 +268,25 @@ romav2-onnx/
 ├── scripts/
 │   ├── export_onnx.py        # Export + validate
 │   ├── visualize.py          # 6-panel visualisation (ONNX or PyTorch)
-│   └── triton_client.py      # Triton HTTP client + visualisation
+│   ├── triton_client.py      # Triton HTTP client + visualisation
+│   └── triton_sampled_client.py
 ├── triton/
 │   └── model_repository/
-│       └── romav2/
+│       ├── romav2/
 │           ├── config.pbtxt  # Triton model config
 │           └── 1/            # Place model.onnx here (gitignored)
+│       ├── romav2_bidirectional/
+│           ├── config.pbtxt  # Triton config for --bidirectional exports
+│           └── 1/            # Place bidirectional model.onnx here (gitignored)
+│       ├── romav2_bidirectional_dense/
+│       │   ├── config.pbtxt  # Internal dense ONNX model for the sampled ensemble
+│       │   └── 1/            # Place precision-exported bidirectional model.onnx here
+│       ├── romav2_sampler/
+│       │   ├── config.pbtxt  # Triton Python backend sampler
+│       │   └── 1/
+│       └── romav2_bidirectional_sampled/
+│           ├── config.pbtxt  # User-facing ensemble returning sparse samples
+│           └── 1/            # Empty version directory required by Triton
 └── assets/
     ├── toronto_A.jpg          # Sample input A
     ├── toronto_B.jpg          # Sample input B
