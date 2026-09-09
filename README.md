@@ -125,6 +125,8 @@ Validation passed — PyTorch and ONNX agree wherever the images overlap.
 
 > **Why not a global tolerance?** Wherever the two images do not overlap, the matcher's softmax at temperature 0.1 turns float32 rounding into arbitrarily different warps and precisions: on real images the unmasked warp max is ~0.15–0.7 while the confident pixels agree to ~0.01, and PyTorch CPU vs PyTorch CUDA differ just as much in those regions. Random inputs are unmatched everywhere, so they cannot be used either. The precise export's in-graph antialiased Resize matches torch's to 1e-4 in the interior (2e-2 on the 4-pixel border, a known ORT-vs-torch edge-handling difference) and does not change the picture.
 >
+> **GPU memory.** The native local-correlation path used to gather all 49 window offsets of the patch-4 refiner in one tensor; at the precise input size that is two 3.85 GB intermediates, a ~20 GB standalone peak, and a CUDA out-of-memory inside Triton next to the other models on a 24 GB card. `src/romav2/local_correlation.py` now samples one offset at a time (bit-identical result, K static so the batch axis stays dynamic); standalone the ORT CUDA peak drops to 9.0 GB with arena shrinkage enabled as in the Triton config (14.7 GB without it, because ORT adds its memory-pattern buffer on the second run), and with the other dense model loaded Triton settles at about 14.6 GB after precise requests.
+>
 > Both passes run on CPU so the comparison is numerically equivalent; MPS vs CPU diverges by ~0.23 in warp coords for a 24-layer ViT. `scripts/benchmark.py --report` applies the same overlap mask across engines (CPU, MPS, CUDA, ONNX).
 
 ---

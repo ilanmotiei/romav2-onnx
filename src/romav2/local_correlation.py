@@ -56,23 +56,29 @@ def native_torch_local_corr(
     sample_mode="bilinear",
     dtype=torch.float32,
 ):
-    # Vectorized over batch: avoids a Python for-loop so the ONNX graph
-    # is not unrolled for a specific batch size.
+    # One grid_sample per window offset.  Gathering all K offsets at once
+    # (B, c, h, w*K) is what the CUDA extension avoids and what makes the
+    # native path memory-hungry: the patch-4 refiner at 1280x1280 (c=192,
+    # K=49, 320x320 grid) needs two 3.85 GB intermediates, which pushed the
+    # precise ONNX model to ~20 GB and out of memory inside Triton on a 24 GB
+    # GPU.  Per offset the largest intermediate is (B, c, h, w): 78 MB there.
+    # K is static, so the loop unrolls to K GridSample nodes in the ONNX graph
+    # while the batch dimension stays dynamic; the arithmetic (dot product
+    # over c per offset) is unchanged.
     # warp: (B, h, w, 2), local_window: (1, K, 2)
-    local_window_coords = (
-        warp[:, :, :, None, :] + local_window[:, None, None, :, :]
-    ).reshape(B, h, w * K, 2)                          # (B, h, w*K, 2)
-    window_feature = F.grid_sample(
-        feature1,
-        local_window_coords,
-        padding_mode=padding_mode,
-        align_corners=False,
-        mode=sample_mode,
-    )                                                   # (B, c, h, w*K)
-    window_feature = window_feature.reshape(B, c, h, w, K)
-    # feature0: (B, c, h, w); dot with window_feature over channel dim
-    corr = (feature0[..., None] / (c**0.5) * window_feature).sum(dim=1)  # (B, h, w, K)
-    return corr.permute(0, 3, 1, 2)                    # (B, K, h, w)
+    f0 = feature0 / (c**0.5)                            # (B, c, h, w)
+    corrs = []
+    for k in range(K):
+        coords = warp + local_window[:, k][:, None, None, :]   # (B, h, w, 2)
+        window_feature = F.grid_sample(
+            feature1,
+            coords,
+            padding_mode=padding_mode,
+            align_corners=False,
+            mode=sample_mode,
+        )                                               # (B, c, h, w)
+        corrs.append((f0 * window_feature).sum(dim=1))  # (B, h, w)
+    return torch.stack(corrs, dim=1)                    # (B, K, h, w)
 
 
 def local_correlation(
