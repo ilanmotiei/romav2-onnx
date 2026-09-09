@@ -2,6 +2,9 @@ name: "romav2_bidirectional_dense"
 platform: "onnxruntime_onnx"
 max_batch_size: 0
 
+# RoMaV2 dense matcher, "base" setting. Same module for every setting; only the
+# input size differs (see scripts/gen_triton_configs.py). Export with
+#   python scripts/export_onnx.py --setting base
 input [
   {
     name: "img_A"
@@ -56,9 +59,10 @@ instance_group [
 ]
 
 # Bound the ORT GPU arena: kSameAsRequested extends by exactly the requested size instead of
-# the default power-of-two doubling. The dense 640x640 matcher emits huge 5-D warp/precision
-# volumes, so the default strategy over-allocates and the arena grows to swallow the shared
-# 3090 (it never releases), starving the co-resident SAM3 encoder. This matches the SAM3
+# the default power-of-two doubling. The dense matcher emits huge 5-D warp/precision
+# volumes (and the precise setting's 1280 local-correlation window is ~3.9 GB per direction),
+# so the default strategy over-allocates and the arena grows to swallow the shared 3090
+# (it never releases), starving the co-resident SAM3 encoder. This matches the SAM3
 # ONNX models' setting. (Distinct from the disabled TensorRT block below.)
 optimization {
   execution_accelerators {
@@ -75,36 +79,32 @@ optimization {
 # the only numerically-correct precision for this model.
 #
 # PREREQUISITE 1 — the model.onnx in 1/ must be the BAKED-RoPE export
-# (romav2-onnx: `python scripts/export_onnx.py --trt --bidirectional`). RoMaV2's
+# (romav2-onnx: `python scripts/export_onnx.py --setting base --trt`). RoMaV2's
 # DINOv3 RoPE traces the angle .tile() to an `If` with no static shape that TRT's
 # parser rejects; the bake replaces the per-resolution sin/cos with constants (the
-# export pins H=W=640) so the backbone is TRT-parseable. There is currently NO
-# model.onnx here / in S3, so Triton has nothing to build until one is exported.
+# export pins the resolution) so the backbone is TRT-parseable.
 #
 # PREREQUISITE 2 — host RAM. This load-time ORT-TensorRT-EP build is extremely
 # memory-heavy: ORT keeps the full ~1.4GB graph resident, re-serializes the TRT
 # subgraph, AND TensorRT builds its own network — 2-3 simultaneous copies of the
-# weights plus build overhead. The FP16 build of the SMALLER 512 variant already
-# OOM-killed a 24Gi pod; FP32 is HEAVIER (its TRT network is 2x the FP16 one) and
-# this dense/640/bidirectional graph is larger again, so the at-load path needs a
-# box with ~30Gi+ FREE host RAM. It will NOT build on the homelab node.
-# 8GiB workspace is GPU scratch (the 3090 has 24GB) — fixes the earlier
+# weights plus build overhead. The FP16 build of the 512 variant already
+# OOM-killed a 24Gi pod; FP32 is HEAVIER (its TRT network is 2x the FP16 one), so
+# the at-load path needs a box with ~30Gi+ FREE host RAM. It will NOT build on the
+# homelab node. 8GiB workspace is GPU scratch (the 3090 has 24GB) — fixes the earlier
 # "insufficient workspace at refiners.4/Concat" failure; it does not affect host RAM.
 #
 # On a memory-constrained node use the PREBUILT-PLAN path instead: build the .plan
 # offline with trtexec (FP32 peaks only ~10-11GiB host, vs >24GiB for ORT-EP) and
 # deploy as platform "tensorrt_plan" — Triton then just deserializes it at load.
-# See models/romav2/romav2_raw_trt for that pattern.
 #
-# DISABLED — this block does not load against the model.onnx currently in S3 (the plain,
-# non-baked-RoPE export). ORT partitions that graph and hands TRT a subgraph whose input
-# `/model/f/rope_embed/Sub_1_output_0` has a dynamic shape with no profile, so the load
-# fails outright with:
+# DISABLED — against a plain (non-baked-RoPE) export ORT hands TRT a subgraph whose
+# input `/model/f/rope_embed/Sub_1_output_0` has a dynamic shape with no profile, so
+# the load fails outright with:
 #   "Following input(s) has no associated shape profiles provided: /model/f/rope_embed/..."
 # and — because strict_readiness gates the pod on ALL models loading — that takes the whole
-# Triton server down, not just this model. PREREQUISITE 1 above is the unmet condition.
-# Re-enable only together with the baked-RoPE export, and only on a node that satisfies
-# PREREQUISITE 2. Until then the model runs on the plain CUDA EP, which is what serves today.
+# Triton server down, not just this model. Re-enable only together with the baked-RoPE
+# export, and only on a node that satisfies PREREQUISITE 2. Until then the model runs on
+# the plain CUDA EP, which is what serves today.
 #
 # optimization {
 #   execution_accelerators {

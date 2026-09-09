@@ -34,9 +34,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-# (H_lr, H_hr) per setting — mirrors RoMaV2.apply_setting.
-RESOLUTIONS = {"turbo": (320, None), "fast": (512, None),
-               "base": (640, None), "precise": (800, 1280)}
+# Input size per setting: what the exported model takes (precise derives its 800
+# low-res pass in-graph from the 1280 input). Mirrors scripts/visualize.INPUT_SIZES.
+INPUT_SIZES = {"turbo": 320, "fast": 512, "base": 640, "precise": 1280}
 
 
 # ── samples ──────────────────────────────────────────────────────────────────
@@ -71,12 +71,8 @@ def resize(img: torch.Tensor, size: int) -> torch.Tensor:
 
 
 def prepare_inputs(img_A: Image.Image, img_B: Image.Image, setting: str) -> list[torch.Tensor]:
-    H_lr, H_hr = RESOLUTIONS[setting]
-    tA, tB = to_tensor(img_A), to_tensor(img_B)
-    inputs = [resize(tA, H_lr), resize(tB, H_lr)]
-    if H_hr is not None:
-        inputs += [resize(tA, H_hr), resize(tB, H_hr)]
-    return inputs
+    size = INPUT_SIZES[setting]
+    return [resize(to_tensor(img_A), size), resize(to_tensor(img_B), size)]
 
 
 # ── engines ──────────────────────────────────────────────────────────────────
@@ -145,10 +141,9 @@ def run(args: argparse.Namespace) -> None:
     load_s = time.perf_counter() - t0
     print(f"[{args.engine}] loaded in {load_s:.1f}s  {engine.info}")
 
-    n_in = 4 if RESOLUTIONS[args.setting][1] is not None else 2
-    if len(engine.input_names) != n_in:
-        raise SystemExit(f"{args.engine} expects {len(engine.input_names)} inputs "
-                         f"{engine.input_names}, setting '{args.setting}' provides {n_in}")
+    if len(engine.input_names) != 2:
+        raise SystemExit(f"{args.engine} expects inputs {engine.input_names}; every setting "
+                         "provides exactly img_A and img_B (unified interface)")
 
     # Warm-up (first call pays for allocator growth / kernel selection).
     inputs = prepare_inputs(samples[0][1], samples[0][2], args.setting)
@@ -222,7 +217,7 @@ def report(out_dir: str, reference: str = "torch-cpu") -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark RoMaV2 PyTorch vs ONNX Runtime")
     parser.add_argument("--engine", choices=["torch-cpu", "torch-mps", "torch-cuda", "onnx"])
-    parser.add_argument("--setting", default="precise", choices=list(RESOLUTIONS))
+    parser.add_argument("--setting", default="precise", choices=list(INPUT_SIZES))
     parser.add_argument("--onnx", help="path to .onnx (for --engine onnx)")
     parser.add_argument("--provider", default="CPUExecutionProvider",
                         help="ORT execution provider (for --engine onnx)")

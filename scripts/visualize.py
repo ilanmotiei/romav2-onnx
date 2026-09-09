@@ -3,16 +3,15 @@
 Usage:
     python scripts/visualize.py                                  # PyTorch model, fast
     python scripts/visualize.py --onnx romav2_fast.onnx          # ONNX model
-    python scripts/visualize.py --onnx romav2_fast_bidir.onnx    # bidirectional ONNX
     python scripts/visualize.py --onnx romav2_precise.onnx --setting precise
     python scripts/visualize.py --img-a assets/toronto_A.jpg --img-b assets/toronto_B.jpg
 
-Composite layout (one 2x3 block per direction, plus an error block when the
-export carries precision matrices):
+Every setting takes one image per side at its input size (see INPUT_SIZES) and
+returns both directions plus precision, so the composite is always:
     A->B  row 1: image A            | image B         | B warped into A (warp_AB)
           row 2: overlap_AB heatmap | alpha blend     | correspondences (overlap > 0.5)
-    B->A  (same, with the roles swapped)            — bidirectional exports only
-    err   expected error A->B | expected error B->A | legend  — precision exports only
+    B->A  (same, with the roles swapped)
+    err   expected error A->B | expected error B->A | legend
 
 The image helpers here are shared with scripts/triton_client.py and
 scripts/triton_sampled_client.py; torch is only imported for the PyTorch path.
@@ -30,16 +29,20 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))   # embedded romav2
 sys.path.insert(0, str(Path(__file__).resolve().parent))               # scripts/ → export_onnx
 
-# (H_lr, H_hr) per setting — mirrors RoMaV2.apply_setting.
-RESOLUTIONS = {"turbo": (320, None), "fast": (512, None),
-               "base": (640, None), "precise": (800, 1280)}
+# Input size per setting — the image the exported model takes (H_hr for the
+# two-stage precise setting, which derives its 800 low-res pass in-graph).
+INPUT_SIZES = {"turbo": 320, "fast": 512, "base": 640, "precise": 1280}
 
 
 # ── inputs ───────────────────────────────────────────────────────────────────
 
 def load_image(path: str, size: int) -> tuple[np.ndarray, np.ndarray]:
-    """Resize to size×size; return (HxWx3 uint8 for display, 1x3xHxW float32 in [0,1])."""
-    img = Image.open(path).convert("RGB").resize((size, size), Image.LANCZOS)
+    """Resize to size×size; return (HxWx3 uint8 for display, 1x3xHxW float32 in [0,1]).
+
+    PIL's BICUBIC is the same antialiased cubic RoMaV2.match() applies with
+    torch (bicubic, antialias=True), so this matches the upstream preprocessing.
+    """
+    img = Image.open(path).convert("RGB").resize((size, size), Image.BICUBIC)
     arr = np.array(img)                                                  # H W 3 uint8
     tensor = (arr.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]  # 1 3 H W
     return arr, tensor
@@ -47,20 +50,14 @@ def load_image(path: str, size: int) -> tuple[np.ndarray, np.ndarray]:
 
 def prepare(img_A_path: str, img_B_path: str, setting: str
             ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """Display images at the output resolution + the model's named inputs.
+    """Display images + the model's named inputs {img_A, img_B} at the setting's input size.
 
-    turbo/fast/base: {img_A, img_B} at H_lr.
-    precise:         {img_A_lr, img_B_lr} at 800 and {img_A_hr, img_B_hr} at 1280;
-                     every output is at the high resolution.
+    Outputs come back at that same size, so the display images line up with them.
     """
-    H_lr, H_hr = RESOLUTIONS[setting]
-    disp_A, lr_A = load_image(img_A_path, H_lr)
-    disp_B, lr_B = load_image(img_B_path, H_lr)
-    if H_hr is None:
-        return disp_A, disp_B, {"img_A": lr_A, "img_B": lr_B}
-    disp_A, hr_A = load_image(img_A_path, H_hr)
-    disp_B, hr_B = load_image(img_B_path, H_hr)
-    return disp_A, disp_B, {"img_A_lr": lr_A, "img_B_lr": lr_B, "img_A_hr": hr_A, "img_B_hr": hr_B}
+    size = INPUT_SIZES[setting]
+    disp_A, in_A = load_image(img_A_path, size)
+    disp_B, in_B = load_image(img_B_path, size)
+    return disp_A, disp_B, {"img_A": in_A, "img_B": in_B}
 
 
 # ── drawing helpers ──────────────────────────────────────────────────────────
@@ -236,13 +233,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--img-a",   default="assets/toronto_A.jpg")
     parser.add_argument("--img-b",   default="assets/toronto_B.jpg")
-    parser.add_argument("--setting", default="fast", choices=list(RESOLUTIONS))
+    parser.add_argument("--setting", default="fast", choices=list(INPUT_SIZES))
     parser.add_argument("--onnx",    default=None, help="Path to .onnx file; omit to use PyTorch")
     parser.add_argument("--out",     default="assets/match_result.png")
     args = parser.parse_args()
 
-    H_lr, H_hr = RESOLUTIONS[args.setting]
-    print(f"Loading images (setting={args.setting}: {H_lr}" + (f" + {H_hr} hr" if H_hr else "") + ") ...")
+    print(f"Loading images (setting={args.setting}: {INPUT_SIZES[args.setting]}x{INPUT_SIZES[args.setting]}) ...")
     img_A_np, img_B_np, inputs = prepare(args.img_a, args.img_b, args.setting)
 
     if args.onnx:

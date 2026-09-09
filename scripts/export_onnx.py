@@ -1,48 +1,29 @@
-"""Export RoMaV2 to ONNX.
+"""Export RoMaV2 to ONNX with one interface for every setting.
+
+Every export exposes the same Triton module; settings differ only in the
+input size S (320 turbo / 512 fast / 640 base / 1280 precise):
+
+    inputs   img_A, img_B   float32 (B, 3, S, S), values in [0, 1]
+    outputs  warp_AB        (B, S, S, 2)     dense warp, normalized coords [-1, 1]
+             overlap_AB     (B, S, S, 1)     overlap probability in [0, 1]
+             precision_AB   (B, S, S, 2, 2)  precision matrices (RoMaV2.sample)
+             warp_BA, overlap_BA, precision_BA   (same, B -> A)
+
+Two-stage settings (precise) take the 1280x1280 image and derive the 800x800
+low-res pass INSIDE the graph with an antialiased bicubic Resize -- the same
+filter RoMaV2.match() applies -- so the client sends one image per side like
+every other setting.  That needs ONNX opset >= 18 (Resize "antialias").
 
 Usage:
-    # Fast setting (512x512, unidirectional, no HR) - simplest graph:
-    python scripts/export_onnx.py
-
-    # Fast setting with both A->B and B->A outputs:
-    python scripts/export_onnx.py --bidirectional --output romav2_fast_bidir.onnx
-
-    # TensorRT-ready (bakes RoPE -> no If/Range so TensorRT can parse the graph;
-    # composes with --bidirectional for the dense/bidir model):
-    python scripts/export_onnx.py --trt --output romav2_fast_trt.onnx
-
-    # Precise setting (800 low-res + 1280 high-res stage; bidirectional and
-    # precision outputs are implied by the setting):
+    python scripts/export_onnx.py --setting fast    --output romav2_fast.onnx
+    python scripts/export_onnx.py --setting base    --output romav2_base.onnx
     python scripts/export_onnx.py --setting precise --output romav2_precise.onnx
 
-    # Validate an already-exported model (pass the same flags used to export it):
-    python scripts/export_onnx.py --validate romav2_fast.onnx
+    # TensorRT-ready (bakes RoPE -> no If/Range so TensorRT can parse the graph):
+    python scripts/export_onnx.py --setting base --trt --output romav2_base_trt.onnx
+
+    # Validate an already-exported model against PyTorch on CPU:
     python scripts/export_onnx.py --validate romav2_precise.onnx --setting precise
-
-Exported inputs (float32, values in [0, 1]) - turbo / fast / base:
-    img_A  (B, 3, H, W)
-    img_B  (B, 3, H, W)
-
-Exported outputs:
-    warp_AB     (B, H, W, 2)   — dense warp in normalized coords [-1, 1]
-    overlap_AB  (B, H, W, 1)   — overlap probability in [0, 1]
-
-With --bidirectional, the export also includes:
-    warp_BA     (B, H, W, 2)
-    overlap_BA  (B, H, W, 1)
-
-With --include-precision, the export also includes:
-    precision_AB  (B, H, W, 2, 2)
-    precision_BA  (B, H, W, 2, 2)  # when combined with --bidirectional
-
-Two-stage settings (precise) take both resolutions — the antialiased bicubic
-resize RoMaV2.match() applies has no ONNX symbolic, so resizing stays on the
-client — and always export both directions plus precision.  All spatial
-outputs are at the high resolution:
-    inputs   img_A_lr, img_B_lr  (B, 3, 800, 800)
-             img_A_hr, img_B_hr  (B, 3, 1280, 1280)
-    outputs  warp_AB, overlap_AB, precision_AB      (B, 1280, 1280, 2 | 1 | 2x2)
-             warp_BA, overlap_BA, precision_BA
 """
 
 from __future__ import annotations
@@ -55,6 +36,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -68,72 +50,66 @@ from romav2.romav2 import RoMaV2, _map_confidence
 
 _CPU = torch.device("cpu")
 
+INPUT_NAMES = ["img_A", "img_B"]
+OUTPUT_NAMES = ["warp_AB", "overlap_AB", "precision_AB",
+                "warp_BA", "overlap_BA", "precision_BA"]
+MIN_OPSET_TWO_STAGE = 18   # Resize gained the `antialias` attribute in opset 18
+
 
 # ── Wrapper ──────────────────────────────────────────────────────────────────
 
-class RoMaV2OnnxWrapper(nn.Module):
-    """Thin wrapper that exposes a flat ONNX-friendly interface.
+class _Resize(nn.Module):
+    """Bicubic resize to a fixed size, matching RoMaV2.match()'s antialiased bicubic.
 
-    The underlying RoMaV2.forward returns an OrderedDict with many
-    intermediate tensors and potential None values, neither of which
-    are valid ONNX outputs.  This wrapper extracts only the final
-    outputs and returns them as a plain tuple.
-
-    Inputs follow the model's setting: (img_A, img_B) for single-stage
-    settings, (img_A_lr, img_B_lr, img_A_hr, img_B_hr) for two-stage ones
-    (precise).  Outputs are warp_AB, overlap_AB[, precision_AB] and, when
-    bidirectional, warp_BA, overlap_BA[, precision_BA].  Both choices are
-    fixed at trace time, so the exported graph is straight-line either way.
+    In eager mode (validation, benchmarks, the RoPE dry run) this IS the upstream
+    call.  The TorchScript exporter has no symbolic for the antialiased kernel, so
+    while tracing we emit the plain bicubic Resize and `patch_antialias()` turns
+    it into the antialiased PIL-style cubic (coefficient -0.5) after export --
+    ONNX Runtime's implementation matches torch's to ~1e-5.
     """
 
-    def __init__(
-        self,
-        model: RoMaV2,
-        *,
-        bidirectional_outputs: bool = False,
-        precision_outputs: bool = False,
-    ) -> None:
+    def __init__(self, H: int, W: int) -> None:
+        super().__init__()
+        self.size = (H, W)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, size=self.size, mode="bicubic", align_corners=False,
+                             antialias=not torch.jit.is_tracing())
+
+
+class RoMaV2OnnxWrapper(nn.Module):
+    """Expose RoMaV2 as the flat, setting-independent Triton interface.
+
+    The underlying RoMaV2.forward returns an OrderedDict with many intermediate
+    tensors and potential None values, neither of which are valid ONNX outputs.
+    This wrapper always runs both directions, takes one image per side at the
+    setting's input size, and returns (warp, overlap, precision) x (AB, BA).
+    Two-stage settings resize the input down to the low-res pass in-graph.
+    """
+
+    def __init__(self, model: RoMaV2) -> None:
         super().__init__()
         self.model = model
-        self.bidirectional_outputs = bidirectional_outputs
-        self.precision_outputs = precision_outputs
+        self.two_stage = model.H_hr is not None
+        if self.two_stage:
+            self.resize_lr = _Resize(model.H_lr, model.W_lr)
+            self.input_hw = (model.H_hr, model.W_hr)
+        else:
+            self.input_hw = (model.H_lr, model.W_lr)
 
-    @property
-    def two_stage(self) -> bool:
-        return self.model.H_hr is not None
-
-    def forward(
-        self,
-        img_A_lr: torch.Tensor,
-        img_B_lr: torch.Tensor,
-        img_A_hr: torch.Tensor | None = None,
-        img_B_hr: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        preds = self.model(img_A_lr, img_B_lr, img_A_hr=img_A_hr, img_B_hr=img_B_hr)
+    def forward(self, img_A: torch.Tensor, img_B: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if self.two_stage:
+            preds = self.model(self.resize_lr(img_A), self.resize_lr(img_B),
+                               img_A_hr=img_A, img_B_hr=img_B)
+        else:
+            preds = self.model(img_A, img_B)
         # Use the setting's threshold so the graph matches RoMaV2.match().
         # (None for turbo/fast/base/precise; 0.05 for the benchmark settings.)
         threshold = self.model.threshold
-        warp_AB = preds["warp_AB"]
-        overlap_AB, precision_AB = _map_confidence(
-            confidence=preds["confidence_AB"], threshold=threshold
-        )
-        if not self.bidirectional_outputs:
-            if self.precision_outputs:
-                return warp_AB, overlap_AB, precision_AB
-            return warp_AB, overlap_AB
-
-        warp_BA = preds["warp_BA"]
-        confidence_BA = preds["confidence_BA"]
-        if warp_BA is None or confidence_BA is None:
-            raise RuntimeError(
-                "Bidirectional export requested, but model did not produce B->A outputs"
-            )
-        overlap_BA, precision_BA = _map_confidence(
-            confidence=confidence_BA, threshold=threshold
-        )
-        if self.precision_outputs:
-            return warp_AB, overlap_AB, precision_AB, warp_BA, overlap_BA, precision_BA
-        return warp_AB, overlap_AB, warp_BA, overlap_BA
+        overlap_AB, precision_AB = _map_confidence(confidence=preds["confidence_AB"], threshold=threshold)
+        overlap_BA, precision_BA = _map_confidence(confidence=preds["confidence_BA"], threshold=threshold)
+        return (preds["warp_AB"], overlap_AB, precision_AB,
+                preds["warp_BA"], overlap_BA, precision_BA)
 
 
 def io_spec(
@@ -141,29 +117,13 @@ def io_spec(
 ) -> tuple[list[str], list[str], tuple[torch.Tensor, ...], dict[str, dict[int, str]]]:
     """(input_names, output_names, dummy_inputs, dynamic_axes) for a wrapper.
 
-    Dummy inputs are CPU tensors at the setting's pinned resolution(s); only the
-    batch axis is dynamic.
+    Dummy inputs are CPU tensors at the setting's input size; only the batch
+    axis is dynamic.
     """
-    m = wrapper.model
-    H, W = m.H_lr, m.W_lr
-    if not wrapper.two_stage:
-        input_names = ["img_A", "img_B"]
-        dummies = (torch.randn(1, 3, H, W), torch.randn(1, 3, H, W))
-    else:
-        input_names = ["img_A_lr", "img_B_lr", "img_A_hr", "img_B_hr"]
-        dummies = (
-            torch.randn(1, 3, H, W), torch.randn(1, 3, H, W),
-            torch.randn(1, 3, m.H_hr, m.W_hr), torch.randn(1, 3, m.H_hr, m.W_hr),
-        )
-    output_names = ["warp_AB", "overlap_AB"]
-    if wrapper.precision_outputs:
-        output_names.append("precision_AB")
-    if wrapper.bidirectional_outputs:
-        output_names.extend(["warp_BA", "overlap_BA"])
-        if wrapper.precision_outputs:
-            output_names.append("precision_BA")
-    dynamic_axes = {name: {0: "batch"} for name in input_names + output_names}
-    return input_names, output_names, dummies, dynamic_axes
+    H, W = wrapper.input_hw
+    dummies = (torch.randn(1, 3, H, W), torch.randn(1, 3, H, W))
+    dynamic_axes = {name: {0: "batch"} for name in INPUT_NAMES + OUTPUT_NAMES}
+    return list(INPUT_NAMES), list(OUTPUT_NAMES), dummies, dynamic_axes
 
 
 # ── Build ────────────────────────────────────────────────────────────────────
@@ -177,13 +137,7 @@ def _native_device() -> torch.device:
     return torch.device("cpu")
 
 
-def build_model(
-    setting: str = "fast",
-    *,
-    force_cpu: bool = True,
-    bidirectional: bool = False,
-    include_precision: bool = False,
-) -> RoMaV2OnnxWrapper:
+def build_model(setting: str = "fast", *, force_cpu: bool = True) -> RoMaV2OnnxWrapper:
     """Build the model wrapper.
 
     force_cpu=True  → patches all romav2 module device bindings to CPU and
@@ -192,10 +146,8 @@ def build_model(
                       Use this for the PyTorch reference pass during validation
                       so that the accelerator is utilised and it does not stall.
 
-    bidirectional / include_precision add the B->A and precision outputs on
-    top of the setting.  Two-stage settings (precise) are bidirectional by
-    construction and always export precision, since that is the interface
-    the Triton sampler consumes.
+    Every setting is exported bidirectional (the unified interface), so the
+    B->A pass is switched on regardless of what the setting says upstream.
     """
     torch.set_float32_matmul_precision("highest")
 
@@ -221,18 +173,12 @@ def build_model(
         setting=setting,
     )
     model = RoMaV2(cfg)
-    if bidirectional:
-        model.bidirectional = True
-    two_stage = model.H_hr is not None
+    model.bidirectional = True
 
     model.to(target_dev).float()
 
     model.eval()
-    wrapper = RoMaV2OnnxWrapper(
-        model,
-        bidirectional_outputs=model.bidirectional,
-        precision_outputs=include_precision or two_stage,
-    )
+    wrapper = RoMaV2OnnxWrapper(model)
     wrapper.eval()
     return wrapper
 
@@ -260,10 +206,8 @@ def bake_rope_for_trt(wrapper: RoMaV2OnnxWrapper, H: int, W: int) -> int:
     depends only on (H, W), never on image content.  GridSample and any other op
     TRT doesn't support fall back gracefully — no graph surgery needed.
 
-    Composes with --bidirectional/--include-precision and with two-stage
-    settings: it walks the same module tree regardless of how many inputs or
-    outputs the wrapper exposes.  RoPE only runs on the low-res pass (the
-    high-res stage is VGG-only), so a two-stage export still has one grid.
+    Works for two-stage settings too: RoPE only runs on the low-res pass (the
+    high-res stage is VGG-only), so there is still a single grid to bake.
 
     Returns the number of RoPE modules baked.
     """
@@ -323,23 +267,52 @@ def bake_rope_for_trt(wrapper: RoMaV2OnnxWrapper, H: int, W: int) -> int:
     return len(rope_mods)
 
 
+# ── In-graph resize: antialias patch ─────────────────────────────────────────
+
+def patch_antialias(onnx_path: str) -> int:
+    """Turn the wrapper's traced plain-bicubic Resize nodes into antialiased ones.
+
+    Only nodes traced from ``_Resize`` (scope ``/resize_lr``) are touched; the
+    model's own bilinear upsamplers are left alone.  Coefficient -0.5 with
+    antialias=1 is the PIL-style cubic that torch's antialiased bicubic uses.
+    Returns the number of patched nodes (2: image A and image B).
+    """
+    import onnx
+    from onnx import helper
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    opset = next(o.version for o in model.opset_import if o.domain in ("", "ai.onnx"))
+    if opset < MIN_OPSET_TWO_STAGE:
+        raise RuntimeError(f"Resize antialias needs opset >= {MIN_OPSET_TWO_STAGE}, model has {opset}")
+    patched = 0
+    for node in model.graph.node:
+        if node.op_type != "Resize" or "/resize_lr" not in node.name:
+            continue
+        attrs = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+        if attrs.get("mode") != b"cubic":
+            raise RuntimeError(f"unexpected Resize mode on {node.name}: {attrs.get('mode')}")
+        attrs.update(cubic_coeff_a=-0.5, antialias=1)
+        del node.attribute[:]
+        node.attribute.extend(helper.make_attribute(k, v) for k, v in attrs.items())
+        patched += 1
+    if patched != 2:
+        raise RuntimeError(f"expected 2 in-graph resize nodes to patch, found {patched}")
+    onnx.save(model, onnx_path)
+    return patched
+
+
 # ── Export ───────────────────────────────────────────────────────────────────
 
 def export(
     output_path: str = "romav2_fast.onnx",
     setting: str = "fast",
-    opset: int = 17,
-    bidirectional: bool = False,
-    include_precision: bool = False,
+    opset: int = 18,
     trt: bool = False,
 ) -> None:
-    wrapper = build_model(
-        setting,
-        bidirectional=bidirectional,
-        include_precision=include_precision,
-    )
+    wrapper = build_model(setting)
+    if wrapper.two_stage and opset < MIN_OPSET_TWO_STAGE:
+        raise SystemExit(f"setting '{setting}' resizes in-graph and needs --opset >= {MIN_OPSET_TWO_STAGE}")
 
-    # Input resolution is determined by the chosen setting.
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
 
     if trt:
@@ -348,14 +321,10 @@ def export(
 
     input_names, output_names, dummies, dynamic_axes = io_spec(wrapper)
 
-    res = f"{H}x{W}" + (f" + {wrapper.model.H_hr}x{wrapper.model.W_hr} hr"
-                        if wrapper.two_stage else "")
-    print(
-        f"Exporting with setting='{setting}', input {res}, opset={opset}, "
-        f"bidirectional={wrapper.bidirectional_outputs}, "
-        f"include_precision={wrapper.precision_outputs}, trt={trt}\n"
-        f"    inputs={input_names}\n    outputs={output_names} ..."
-    )
+    res = f"{wrapper.input_hw[0]}x{wrapper.input_hw[1]}" + (
+        f" (low-res pass {H}x{W} resized in-graph)" if wrapper.two_stage else "")
+    print(f"Exporting setting='{setting}', input {res}, opset={opset}, trt={trt}\n"
+          f"    inputs={input_names}\n    outputs={output_names} ...")
 
     with torch.no_grad():
         torch.onnx.export(
@@ -374,18 +343,95 @@ def export(
             dynamo=False,
         )
 
+    if wrapper.two_stage:
+        n = patch_antialias(output_path)
+        print(f"Patched {n} in-graph Resize node(s) to antialiased bicubic.")
+
     print(f"Saved → {output_path}")
 
 
 # ── Validate ─────────────────────────────────────────────────────────────────
 
-def validate(
-    onnx_path: str,
-    setting: str = "fast",
-    atol: float = 2e-2,
-    bidirectional: bool = False,
-    include_precision: bool = False,
-) -> None:
+ASSETS = Path(__file__).resolve().parents[1] / "assets"
+DEFAULT_PAIR = (ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
+
+
+def load_pair(input_hw, img_a=DEFAULT_PAIR[0], img_b=DEFAULT_PAIR[1]):
+    """Load two images as float32 (1, 3, H, W) tensors in [0, 1], resized to
+    ``input_hw`` the way RoMaV2.match() does it (antialiased bicubic straight
+    from the original)."""
+    from PIL import Image
+
+    def load(path):
+        x = torch.from_numpy(np.array(Image.open(path).convert("RGB")))
+        x = x.permute(2, 0, 1).float()[None] / 255
+        return F.interpolate(x, size=tuple(input_hw), mode="bicubic",
+                             align_corners=False, antialias=True)
+
+    return [load(img_a), load(img_b)]
+
+
+def _compare_direction(d, pt, ox, *, warp_atol, overlap_atol, precision_rtol,
+                       min_pixels=100):
+    """Compare one direction ("AB" / "BA") of PyTorch vs ONNX outputs (batch
+    element 0). Prints the statistics and returns a list of failure strings."""
+    failures = []
+    ovl = pt[f"overlap_{d}"][..., 0]
+    mask = ovl > 0.5
+    n = int(mask.sum())
+
+    dw = np.abs(pt[f"warp_{d}"] - ox[f"warp_{d}"]).max(-1)
+    do = np.abs(ovl - ox[f"overlap_{d}"][..., 0])
+    pa = pt[f"precision_{d}"].reshape(*mask.shape, 4)
+    pb = ox[f"precision_{d}"].reshape(*mask.shape, 4)
+    rel = np.abs(pa - pb).max(-1) / (np.abs(pa).max(-1) + 1e-6)
+
+    print(f"      {d}: PyTorch overlap > 0.5 on {mask.mean():.1%} of pixels ({n})")
+    print(f"        warp      |diff| unmasked: median {np.median(dw):.5f}  "
+          f"p99 {np.percentile(dw, 99):.4f}  max {dw.max():.4f}  (informational)")
+    print(f"        overlap   |diff| mean {do.mean():.5f}  max {do.max():.4f}  "
+          f"(mean limit {overlap_atol})")
+    if do.mean() > overlap_atol:
+        failures.append(f"{d}: overlap mean |diff| {do.mean():.4f} > {overlap_atol}")
+    if n < min_pixels:
+        print(f"        fewer than {min_pixels} confident pixels: warp/precision "
+              "checks skipped for this direction")
+        return failures
+    wm, rm = dw[mask], rel[mask]
+    print(f"        warp      |diff| in overlap>0.5: p99 {np.percentile(wm, 99):.4f}  "
+          f"max {wm.max():.4f}  (max limit {warp_atol})")
+    print(f"        precision rel diff in overlap>0.5: median {np.median(rm):.2e}  "
+          f"p99 {np.percentile(rm, 99):.3f}  max {rm.max():.3f}  (p99 limit {precision_rtol})")
+    if wm.max() > warp_atol:
+        failures.append(f"{d}: warp max |diff| in confident pixels {wm.max():.4f} > {warp_atol}")
+    if np.percentile(rm, 99) > precision_rtol:
+        failures.append(f"{d}: precision rel diff p99 in confident pixels "
+                        f"{np.percentile(rm, 99):.3f} > {precision_rtol}")
+    return failures
+
+
+def validate(onnx_path: str, setting: str = "fast", *,
+             img_a=DEFAULT_PAIR[0], img_b=DEFAULT_PAIR[1],
+             warp_atol: float = 0.05, overlap_atol: float = 0.01,
+             precision_rtol: float = 0.3) -> None:
+    """Compare an exported model with the PyTorch reference on a real image pair.
+
+    Max-abs over the whole output is the wrong metric for this model: wherever
+    the two images do not overlap, the matcher's softmax (temperature 0.1)
+    turns float32 rounding into arbitrarily different warps and precisions --
+    PyTorch CPU vs PyTorch CUDA differ just as much there.  Random inputs are
+    unmatched everywhere, so they cannot be used either.  The check therefore
+    runs the bundled Toronto pair, resized exactly like RoMaV2.match() does,
+    and compares per direction:
+
+      * warp       max |diff| where PyTorch overlap > 0.5    <= warp_atol
+      * overlap    mean |diff| over the whole map            <= overlap_atol
+      * precision  p99 relative diff where overlap > 0.5     <= precision_rtol
+
+    Reference (precise, CPU): warp max 0.017, overlap mean 0.0002, precision
+    p99 0.12.  A broken export (wrong resize, swapped outputs, ...) is off by
+    0.3+ on the warp, so the limits leave a wide margin either way.
+    """
     import time
 
     try:
@@ -394,26 +440,20 @@ def validate(
         raise SystemExit("onnxruntime is required for validation: pip install onnxruntime")
 
     # ── Step 1: build PyTorch model on CPU ───────────────────────────────────
-    # ONNX Runtime always runs on CPU.  To get numerically identical results
-    # we must also run the PyTorch reference pass on CPU (force_cpu=True).
-    # MPS vs CPU float32 diverge by ~0.23 in warp coords for a 24-layer ViT.
-    print(f"[1/5] Building PyTorch model on CPU (downloads weights on first run) ...")
+    # ONNX Runtime runs on CPU here, so the reference pass runs on CPU too:
+    # MPS/CUDA vs CPU float32 already diverge far beyond the tolerances.
+    print("[1/5] Building PyTorch model on CPU (downloads weights on first run) ...")
     t0 = time.time()
-    wrapper = build_model(
-        setting,
-        force_cpu=True,
-        bidirectional=bidirectional,
-        include_precision=include_precision,
-    )
+    wrapper = build_model(setting, force_cpu=True)
     print(f"      Done in {time.time() - t0:.1f}s  (model device: cpu)")
 
-    input_names, output_names, dummies, _ = io_spec(wrapper)
-    # Images are expected in [0, 1]; io_spec's randn dummies are only for tracing.
-    inputs = [torch.rand_like(d) for d in dummies]
-    print(f"      Inputs: " + ", ".join(f"{n}{tuple(x.shape)}" for n, x in zip(input_names, inputs)))
+    input_names, output_names, _, _ = io_spec(wrapper)
+    inputs = load_pair(wrapper.input_hw, img_a, img_b)
+    print(f"      Inputs: {Path(img_a).name}, {Path(img_b).name} -> "
+          + ", ".join(f"{n}{tuple(x.shape)}" for n, x in zip(input_names, inputs)))
 
     # ── Step 2: PyTorch forward pass ─────────────────────────────────────────
-    print(f"[2/5] Running PyTorch forward pass on CPU ...")
+    print("[2/5] Running PyTorch forward pass on CPU ...")
     t0 = time.time()
     with torch.no_grad():
         pt_outs = [o.numpy() for o in wrapper(*inputs)]
@@ -434,13 +474,15 @@ def validate(
     print(f"      Done in {time.time() - t0:.1f}s")
     ort_in = [i.name for i in sess.get_inputs()]
     ort_out = [o.name for o in sess.get_outputs()]
-    print(f"      ORT inputs:  {ort_in}")
+    ort_shape = [i.shape for i in sess.get_inputs()]
+    print(f"      ORT inputs:  {list(zip(ort_in, ort_shape))}")
     print(f"      ORT outputs: {ort_out}")
-    if ort_in != input_names or ort_out != output_names:
+    expected_shape = ["batch", 3, *wrapper.input_hw]
+    if ort_in != input_names or ort_out != output_names or any(s != expected_shape for s in ort_shape):
         raise SystemExit(
-            f"ONNX model IO {ort_in} -> {ort_out} does not match the requested "
-            f"configuration ({input_names} -> {output_names}); pass the same "
-            "--setting / --bidirectional / --include-precision used at export."
+            f"ONNX model IO {list(zip(ort_in, ort_shape))} -> {ort_out} does not match setting "
+            f"'{setting}' ({input_names} @ {expected_shape} -> {output_names}); wrong --setting, "
+            "or a model exported before the unified interface?"
         )
 
     # ── Step 4: ONNX inference ────────────────────────────────────────────────
@@ -452,14 +494,17 @@ def validate(
         print(f"      onnx {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}")
 
     # ── Step 5: compare outputs ───────────────────────────────────────────────
-    print(f"[5/5] Comparing outputs (atol={atol}) ...")
-    for name, pt_arr, onnx_arr in zip(output_names, pt_outs, onnx_outs):
-        print(f"      {name}: max|diff|={np.abs(pt_arr - onnx_arr).max():.5f}")
-        np.testing.assert_allclose(
-            pt_arr, onnx_arr, rtol=1e-3, atol=atol,
-            err_msg=f"{name} mismatch between PyTorch and ONNX"
-        )
-    print("Validation passed — PyTorch and ONNX outputs match.")
+    print("[5/5] Comparing outputs (confidence-masked, see validate.__doc__) ...")
+    pt = {n: a[0] for n, a in zip(output_names, pt_outs)}
+    ox = {n: a[0] for n, a in zip(output_names, onnx_outs)}
+    failures = []
+    for d in ("AB", "BA"):
+        failures += _compare_direction(d, pt, ox, warp_atol=warp_atol,
+                                       overlap_atol=overlap_atol,
+                                       precision_rtol=precision_rtol)
+    if failures:
+        raise SystemExit("Validation FAILED:\n  " + "\n  ".join(failures))
+    print("Validation passed — PyTorch and ONNX agree wherever the images overlap.")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -472,32 +517,31 @@ if __name__ == "__main__":
                         help="output .onnx path")
     parser.add_argument("--setting",  default="fast",
                         choices=["turbo", "fast", "base", "precise"],
-                        help="model setting (determines input resolution; precise "
-                             "is two-stage, bidirectional and exports precision)")
-    parser.add_argument("--opset",    type=int, default=17,
-                        help="ONNX opset version")
-    parser.add_argument("--bidirectional", action="store_true",
-                        help="export both A->B and B->A dense warp/overlap outputs")
-    parser.add_argument("--include-precision", action="store_true",
-                        help="also export precision matrices used by RoMaV2.sample")
+                        help="model setting (fixes the input size; precise resizes "
+                             "its 800x800 low-res pass in-graph from the 1280 input)")
+    parser.add_argument("--opset",    type=int, default=18,
+                        help="ONNX opset version (>= 18 required for precise)")
     parser.add_argument("--trt", action="store_true",
                         help="bake RoPE to constants so the graph is "
                              "TensorRT-parseable (removes If/Range)")
+    parser.add_argument("--img-a", default=str(DEFAULT_PAIR[0]),
+                        help="(--validate) image A, resized like RoMaV2.match() does")
+    parser.add_argument("--img-b", default=str(DEFAULT_PAIR[1]),
+                        help="(--validate) image B")
+    parser.add_argument("--warp-atol", type=float, default=0.05,
+                        help="(--validate) max warp |diff| allowed where "
+                             "PyTorch overlap > 0.5 (normalized coords)")
+    # Every export now carries both directions and precision; these are kept so
+    # older command lines and docs keep working.
+    parser.add_argument("--bidirectional", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--include-precision", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.bidirectional or args.include_precision:
+        print("note: --bidirectional / --include-precision are implied by the unified "
+              "interface (every export has warp/overlap/precision for AB and BA).")
 
     if args.validate:
-        validate(
-            args.validate,
-            setting=args.setting,
-            bidirectional=args.bidirectional,
-            include_precision=args.include_precision,
-        )
+        validate(args.validate, setting=args.setting,
+                 img_a=args.img_a, img_b=args.img_b, warp_atol=args.warp_atol)
     else:
-        export(
-            args.output,
-            setting=args.setting,
-            opset=args.opset,
-            bidirectional=args.bidirectional,
-            include_precision=args.include_precision,
-            trt=args.trt,
-        )
+        export(args.output, setting=args.setting, opset=args.opset, trt=args.trt)

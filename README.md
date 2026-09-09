@@ -50,79 +50,82 @@ The modified `romav2` source is embedded directly in `src/` — no separate clon
 
 ## 1 — Export to ONNX
 
+Every setting exports the **same module**: one image per side in, both directions plus precision out. Settings differ only in the input size `S`.
+
 ```bash
-# Fast setting (512×512 input, ~350 MB model)
-python scripts/export_onnx.py --output romav2_fast.onnx --setting fast
-
-# Fast setting with both A→B and B→A dense outputs
-python scripts/export_onnx.py \
-    --output romav2_fast_bidir.onnx \
-    --setting fast \
-    --bidirectional
-
-# Base setting (640×640)
-python scripts/export_onnx.py --output romav2_base.onnx --setting base
+python scripts/export_onnx.py --setting fast    --output romav2_fast.onnx      # 512×512
+python scripts/export_onnx.py --setting base    --output romav2_base.onnx      # 640×640
+python scripts/export_onnx.py --setting precise --output romav2_precise.onnx   # 1280×1280
 ```
 
-Available settings:
+| Setting   | Input size `S` | What runs                                                     |
+|-----------|----------------|---------------------------------------------------------------|
+| `turbo`   | 320×320        | DINOv3 + matcher + one refinement stage                       |
+| `fast`    | 512×512        | same                                                          |
+| `base`    | 640×640        | same                                                          |
+| `precise` | 1280×1280      | 800×800 low-res pass (resized **in-graph**) + 1280 refinement |
 
-| Setting | Input size | Notes |
-|---------|-----------|-------|
-| `turbo` | 320×320 | Fastest, least accurate |
-| `fast`  | 512×512 | Good balance |
-| `base`  | 640×640 | Higher accuracy |
+**Inputs:** `img_A`, `img_B` — `float32 [B, 3, S, S]`, values in `[0, 1]`, resized from the original with an antialiased bicubic filter (PIL `BICUBIC`, or torch `bicubic` with `antialias=True`; that is what upstream `RoMaV2.match()` does).
+
+**Outputs** (all at `S×S`):
+
+| Name | Shape | Meaning |
+|------|-------|---------|
+| `warp_AB`, `warp_BA` | `[B, S, S, 2]` | dense warp, normalised coords in `[-1, 1]` |
+| `overlap_AB`, `overlap_BA` | `[B, S, S, 1]` | overlap probability in `[0, 1]` |
+| `precision_AB`, `precision_BA` | `[B, S, S, 2, 2]` | precision matrices consumed by RoMaV2's `sample()` |
 
 The script:
 - Disables AMP / bfloat16 everywhere so the full graph stays in float32 (required for ORT compatibility)
 - Forces RoPE embeddings to float32
-- Uses the classic TorchScript-based JIT tracer (`dynamo=False`)
-- Bakes H/W into the graph; only the batch dimension is dynamic
+- Switches the B→A pass on for every setting (upstream only does so for `precise`)
+- Uses the classic TorchScript-based JIT tracer (`dynamo=False`) at opset 18
+- Bakes `S` into the graph; only the batch dimension is dynamic
+- For `precise`, traces the 1280→800 resize as a plain bicubic `Resize` and then patches those two nodes to the antialiased PIL-style cubic (`antialias=1`, coefficient −0.5), which ONNX Runtime reproduces to ~1e-5 of torch's. This is why opset 18 is required.
 
-**Inputs:** `img_A`, `img_B` — `float32 [B, 3, H, W]`, values in `[0, 1]`
-**Outputs:** `warp_AB` — `float32 [B, H, W, 2]` (normalised coords in `[-1, 1]`), `overlap_AB` — `float32 [B, H, W, 1]` (probability in `[0, 1]`)
-
-Add `--bidirectional` to also export `warp_BA` and `overlap_BA` with the same shapes. This is slower because the matcher/refiners also compute the B→A direction, but it is useful when downstream sampling or geometry wants both directions.
-
-Add `--include-precision` for models that will feed the Triton sampled ensemble. This also exports `precision_AB` and, with `--bidirectional`, `precision_BA`, matching the precision matrices consumed by RoMaV2's `sample()` flow:
-
-```bash
-python scripts/export_onnx.py \
-    --output romav2_fast_bidir_precision.onnx \
-    --setting fast \
-    --bidirectional \
-    --include-precision
-```
+Add `--trt` to bake the RoPE tables to constants so TensorRT can parse the backbone (see `bake_rope_for_trt` in the script). `--bidirectional` and `--include-precision` are still accepted for old command lines but are implied.
 
 ---
 
 ## 2 — Validate
 
-Runs both the PyTorch model and the exported ONNX model on identical CPU inputs and asserts their outputs match within tolerance.
+Runs the PyTorch model and the exported ONNX model on the bundled Toronto pair (resized exactly like `RoMaV2.match()` does, on CPU for both) and compares them where the comparison is meaningful. Pass the same `--setting` used at export; the check refuses models with a different interface.
 
 ```bash
-python scripts/export_onnx.py --validate romav2_fast.onnx --setting fast
-
-# Validate a bidirectional export
-python scripts/export_onnx.py \
-    --validate romav2_fast_bidir.onnx \
-    --setting fast \
-    --bidirectional
+python scripts/export_onnx.py --validate romav2_fast.onnx    --setting fast
+python scripts/export_onnx.py --validate romav2_precise.onnx --setting precise
+# other images: --img-a path --img-b path; stricter/looser warp limit: --warp-atol
 ```
 
-Expected output:
+Per direction (A→B and B→A) the check asserts:
+
+| quantity | region | limit |
+|---|---|---|
+| warp max abs diff | PyTorch `overlap > 0.5` | 0.05 (`--warp-atol`, normalized coords) |
+| overlap mean abs diff | whole map | 0.01 |
+| precision relative diff, p99 | PyTorch `overlap > 0.5` | 0.3 |
+
+Expected output (precise, laptop CPU):
 ```
-[1/5] Building PyTorch model on CPU ...       Done in 8.2s
-[2/5] Running PyTorch forward pass on CPU ... Done in 7.1s
-      pt_warp:    shape=(1, 512, 512, 2), min=-0.9123, max=0.9087
-      pt_overlap: shape=(1, 512, 512, 1), min=0.0213, max=0.8315
-[3/5] Loading ONNX model from romav2_fast.onnx ... Done in 3.4s
-[4/5] Running ONNX inference (CPU) ...        Done in 7.4s
-      onnx_warp:    shape=(1, 512, 512, 2), min=-0.9123, max=0.9087
-[5/5] Comparing outputs (atol=0.02) ...
-Validation passed — PyTorch and ONNX outputs match.
+[1/5] Building PyTorch model on CPU ...       Done in 5.2s
+      Inputs: toronto_A.jpg, toronto_B.jpg -> img_A(1, 3, 1280, 1280), img_B(1, 3, 1280, 1280)
+[2/5] Running PyTorch forward pass on CPU ... Done in 56.2s
+[3/5] Loading ONNX model from romav2_precise.onnx ... Done in 3.6s
+[4/5] Running ONNX inference (CPU) ...        Done in 37.3s
+[5/5] Comparing outputs (confidence-masked, see validate.__doc__) ...
+      AB: PyTorch overlap > 0.5 on 54.6% of pixels (894780)
+        warp      |diff| unmasked: median 0.00000  p99 0.0001  max 0.1559  (informational)
+        overlap   |diff| mean 0.00016  max 0.0325  (mean limit 0.01)
+        warp      |diff| in overlap>0.5: p99 0.0001  max 0.0121  (max limit 0.05)
+        precision rel diff in overlap>0.5: median 2.11e-04  p99 0.020  max 0.166  (p99 limit 0.3)
+      BA: PyTorch overlap > 0.5 on 1.4% of pixels (23203)
+        ... warp max 0.0164, precision p99 0.119 ...
+Validation passed — PyTorch and ONNX agree wherever the images overlap.
 ```
 
-> Both passes run on CPU so the comparison is numerically equivalent. MPS vs CPU diverges by ~0.23 in warp coords for a 24-layer ViT; always validate CPU-vs-CPU.
+> **Why not a global tolerance?** Wherever the two images do not overlap, the matcher's softmax at temperature 0.1 turns float32 rounding into arbitrarily different warps and precisions: on real images the unmasked warp max is ~0.15–0.7 while the confident pixels agree to ~0.01, and PyTorch CPU vs PyTorch CUDA differ just as much in those regions. Random inputs are unmatched everywhere, so they cannot be used either. The precise export's in-graph antialiased Resize matches torch's to 1e-4 in the interior (2e-2 on the 4-pixel border, a known ORT-vs-torch edge-handling difference) and does not change the picture.
+>
+> Both passes run on CPU so the comparison is numerically equivalent; MPS vs CPU diverges by ~0.23 in warp coords for a 24-layer ViT. `scripts/benchmark.py --report` applies the same overlap mask across engines (CPU, MPS, CUDA, ONNX).
 
 ---
 
@@ -131,9 +134,7 @@ Validation passed — PyTorch and ONNX outputs match.
 ```bash
 # Uses sample images included in this repo
 python scripts/visualize.py --onnx romav2_fast.onnx --out result.png
-
-# Bidirectional ONNX exports are detected automatically and produce both directions
-python scripts/visualize.py --onnx romav2_fast_bidir.onnx --out bidir_result.png
+python scripts/visualize.py --onnx romav2_precise.onnx --setting precise --out precise_result.png
 
 # Or PyTorch model
 python scripts/visualize.py --out result.png
@@ -146,89 +147,93 @@ python scripts/visualize.py \
     --out result.png
 ```
 
-The output is a 6-panel composite (2×3 grid):
+The output stacks one 2×3 block per direction plus an error block:
 
-| Top-left | Top-center | Top-right |
-|----------|------------|-----------|
-| Image A | Image B | Image B warped into A |
-
-| Bottom-left | Bottom-center | Bottom-right |
-|-------------|---------------|--------------|
-| Confidence heatmap | Alpha blend | Dense correspondences |
-
-For bidirectional ONNX exports, the image stacks two 6-panel composites: A→B first, then B→A.
+| | Left | Center | Right |
+|---|---|---|---|
+| A→B row 1 | Image A | Image B | Image B warped into A |
+| A→B row 2 | Overlap heatmap | Alpha blend | Dense correspondences (overlap > 0.5) |
+| B→A | same, roles swapped | | |
+| error | expected error A→B (px, from precision) | expected error B→A | legend |
 
 ![bidirectional ONNX result](assets/bidir_onnx_result.png)
 
 ---
 
-## 4 — Triton Inference Server
+## 4 — Benchmark
 
-### 4.1 Set up the model repository
-
-The `triton/model_repository/romav2/config.pbtxt` is already configured. You only need to place the exported ONNX file:
+`scripts/benchmark.py` times one engine per process on four Toronto-derived pairs and saves outputs so engines can be diffed with an overlap mask:
 
 ```bash
-mkdir -p triton/model_repository/romav2/1
-cp romav2_fast.onnx triton/model_repository/romav2/1/model.onnx
+python scripts/benchmark.py --engine torch-cpu --setting precise --out-dir bench
+python scripts/benchmark.py --engine onnx --onnx romav2_precise.onnx --setting precise --out-dir bench
+python scripts/benchmark.py --engine onnx --onnx romav2_precise.onnx --provider CUDAExecutionProvider --setting precise --out-dir bench
+python scripts/benchmark.py --report bench
 ```
 
-For a bidirectional export, use the separate config:
+Measured for `precise`, batch 1: RTX 3090 — ORT CUDA 1.0 s/pair, PyTorch CUDA 1.1 s/pair; M1 Max CPU — ORT 50 s, PyTorch 66 s. `fast` on the M1 Max CPU: 6.9 s/pair.
+
+---
+
+## 5 — Triton Inference Server
+
+### 5.1 Model repository
+
+Two Triton modules serve every setting, and their `config.pbtxt` files are **generated from one template** so they differ only in name and input size:
+
+| Setting | Dense model (ONNX)            | Sampled ensemble               | `S`  |
+|---------|-------------------------------|--------------------------------|------|
+| fast    | `romav2`                      | `romav2_sampled`               | 512  |
+| base    | `romav2_bidirectional_dense`  | `romav2_bidirectional_sampled` | 640  |
+| precise | `romav2_precise_dense`        | `romav2_precise_sampled`       | 1280 |
 
 ```bash
-mkdir -p triton/model_repository/romav2_bidirectional/1
-cp romav2_fast_bidir.onnx triton/model_repository/romav2_bidirectional/1/model.onnx
+python scripts/gen_triton_configs.py          # regenerate after editing the template
+python scripts/gen_triton_configs.py --check  # CI-style drift check
 ```
 
-To avoid returning dense `H×W×...` tensors over the network, use the sampled ensemble. It chains a precision-exported bidirectional ONNX model into `romav2_sampler`, a Triton Python backend implementation of RoMaV2's sampling flow:
+- **Dense model:** `img_A`, `img_B` `[-1, 3, S, S]` → the six outputs above. GPU instance, bounded CUDA arena and arena shrinkage so it coexists with other models on one GPU.
+- **Sampled ensemble:** same inputs plus `num_corresp` and `seed` (`INT64 [1]`); chains the dense model into `romav2_sampler`, a Triton Python backend implementation of RoMaV2's `sample()` (CuPy on GPU, NumPy fallback). Returns sparse correspondences instead of dense `S×S` tensors — use this from clients that just want matches.
+
+Place the export as `model.onnx` in the dense model's version directory:
 
 ```bash
-mkdir -p triton/model_repository/romav2_bidirectional_dense/1
-cp romav2_fast_bidir_precision.onnx \
-  triton/model_repository/romav2_bidirectional_dense/1/model.onnx
+cp romav2_fast.onnx    triton/model_repository/romav2/1/model.onnx
+cp romav2_precise.onnx triton/model_repository/romav2_precise_dense/1/model.onnx
 ```
 
-Then call the user-facing ensemble model `romav2_bidirectional_sampled`, not the dense model. The dense tensors stay inside Triton.
+The generated configs target a GPU. For a CPU-only Docker run, change `kind: KIND_GPU` to `KIND_CPU` and delete the `optimization` and `parameters` blocks.
 
-If you export `turbo` or `base`, update the `img_A`/`img_B` input dimensions in the relevant `config.pbtxt` to `320×320` or `640×640`.
-
-The checked-in Triton configs keep output dimensions fully dynamic for compatibility with `nvcr.io/nvidia/tritonserver:23.12-py3`. If a newer Triton version reports that the model expects concrete output dimensions, set warp outputs to `[ -1, -1, -1, 2 ]`, overlap outputs to `[ -1, -1, -1, 1 ]`, and precision outputs to `[ -1, -1, -1, 2, 2 ]` in that environment.
-
-### 4.2 Start the server
+### 5.2 Start the server
 
 ```bash
 docker run --rm -d \
-  --name romav2-triton \
+  --name romav2-triton --gpus all \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
   -v $(pwd)/triton/model_repository:/models \
-  nvcr.io/nvidia/tritonserver:23.12-py3 \
+  nvcr.io/nvidia/tritonserver:25.07-py3 \
   tritonserver --model-repository=/models
 ```
 
-Add `--gpus all` if you have a CUDA GPU. Wait ~10 seconds, then verify:
+Wait for the models to load, then verify:
 
 ```bash
-curl http://localhost:8000/v2/health/ready        # → HTTP 200
-curl http://localhost:8000/v2/models/romav2        # → model metadata JSON
+curl http://localhost:8000/v2/health/ready               # → HTTP 200
+curl -X POST http://localhost:8000/v2/repository/index    # → every model READY
 ```
 
-### 4.3 Run inference
+### 5.3 Run inference
 
 ```bash
-python scripts/triton_client.py \
-    assets/toronto_A.jpg assets/toronto_B.jpg \
-    --url localhost:8000 \
-    --out result.png
-```
+# dense outputs + visualisation; --setting fixes the input size
+python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
+    --url localhost:8000 --model romav2 --setting fast --out result.png
+python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
+    --url localhost:8000 --model romav2_precise_dense --setting precise --out precise.png
 
-For the sampled ensemble:
-
-```bash
-python scripts/triton_sampled_client.py \
-    assets/toronto_A.jpg assets/toronto_B.jpg \
-    --url localhost:8000 \
-    --model romav2_bidirectional_sampled \
-    --num-corresp 5000
+# sparse correspondences
+python scripts/triton_sampled_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
+    --url localhost:8000 --model romav2_precise_sampled --setting precise --num-corresp 5000
 ```
 
 The sampled ensemble returns:
@@ -240,19 +245,19 @@ sampled_precision_A  (N, 2, 2)
 sampled_precision_B  (N, 2, 2)
 ```
 
-### 4.4 Use the client in Python
+Convert to pixels with `(p + 1) / 2 * S - 0.5`.
+
+### 5.4 Use the client in Python
 
 ```python
 from scripts.triton_client import infer
 
-warp_AB, overlap_AB = infer(
-    "path/to/image_A.jpg",
-    "path/to/image_B.jpg",
-    url="localhost:8000",       # or remote host:port
-    model_name="romav2",
-)
-# warp_AB:    numpy (512, 512, 2)  normalised coords in [-1, 1]
-# overlap_AB: numpy (512, 512, 1)  probability in [0, 1]
+outs = infer("path/to/image_A.jpg", "path/to/image_B.jpg",
+             url="localhost:8000", model_name="romav2_precise_dense", setting="precise")
+outs["warp_AB"]       # numpy (1280, 1280, 2)     normalised coords in [-1, 1]
+outs["overlap_AB"]    # numpy (1280, 1280, 1)     probability in [0, 1]
+outs["precision_AB"]  # numpy (1280, 1280, 2, 2)
+# ... and warp_BA / overlap_BA / precision_BA
 ```
 
 **Triton result** (identical to direct ONNX):
@@ -266,27 +271,22 @@ warp_AB, overlap_AB = infer(
 ```
 romav2-onnx/
 ├── scripts/
-│   ├── export_onnx.py        # Export + validate
-│   ├── visualize.py          # 6-panel visualisation (ONNX or PyTorch)
-│   ├── triton_client.py      # Triton HTTP client + visualisation
-│   └── triton_sampled_client.py
+│   ├── export_onnx.py           # Export + validate (unified interface)
+│   ├── gen_triton_configs.py    # Generates triton/model_repository/*/config.pbtxt
+│   ├── benchmark.py             # PyTorch vs ONNX Runtime timing + overlap-masked diffs
+│   ├── visualize.py             # Composite visualisation (ONNX or PyTorch); shared image helpers
+│   ├── triton_client.py         # Triton HTTP client for the dense models
+│   └── triton_sampled_client.py # Triton HTTP client for the sampled ensembles
 ├── triton/
 │   └── model_repository/
-│       ├── romav2/
-│           ├── config.pbtxt  # Triton model config
-│           └── 1/            # Place model.onnx here (gitignored)
-│       ├── romav2_bidirectional/
-│           ├── config.pbtxt  # Triton config for --bidirectional exports
-│           └── 1/            # Place bidirectional model.onnx here (gitignored)
-│       ├── romav2_bidirectional_dense/
-│       │   ├── config.pbtxt  # Internal dense ONNX model for the sampled ensemble
-│       │   └── 1/            # Place precision-exported bidirectional model.onnx here
-│       ├── romav2_sampler/
-│       │   ├── config.pbtxt  # Triton Python backend sampler
-│       │   └── 1/
-│       └── romav2_bidirectional_sampled/
-│           ├── config.pbtxt  # User-facing ensemble returning sparse samples
-│           └── 1/            # Empty version directory required by Triton
+│       ├── romav2/                        # dense, fast/512       (config generated)
+│       ├── romav2_sampled/                # ensemble, fast/512    (config generated)
+│       ├── romav2_bidirectional_dense/    # dense, base/640       (config generated)
+│       ├── romav2_bidirectional_sampled/  # ensemble, base/640    (config generated)
+│       ├── romav2_precise_dense/          # dense, precise/1280   (config generated)
+│       ├── romav2_precise_sampled/        # ensemble, precise/1280 (config generated)
+│       └── romav2_sampler/                # shared Python-backend sampler (model.py, sampler.py)
+│           (each */1/ holds model.onnx, gitignored, or an empty .gitkeep)
 └── assets/
     ├── toronto_A.jpg          # Sample input A
     ├── toronto_B.jpg          # Sample input B
@@ -299,6 +299,7 @@ romav2-onnx/
 ## Notes
 
 - **Float32 only** — all AMP/bfloat16 paths are disabled at export time; the full graph runs in float32 for ORT compatibility.
-- **Static H/W** — height and width are baked into the ONNX graph per setting. Export a separate `.onnx` per setting if you need multiple resolutions.
-- **Batch dimension** — the Triton config uses `max_batch_size: 0` with an explicit batch dim in `dims`, matching the ONNX model's fully-dynamic shape annotation. Pass batches of size ≥ 1 from your client.
-- **GPU** — the exported model runs on CPU by default in both ORT and Triton. For CUDA GPU inference in Triton, set `kind: KIND_GPU` in `config.pbtxt` and pass `--gpus all` to Docker.
+- **Static `S`** — the input size is baked into the ONNX graph per setting. Export a separate `.onnx` per setting if you need multiple resolutions.
+- **Batch dimension** — the Triton configs use `max_batch_size: 0` with an explicit batch dim in `dims`, matching the ONNX model's dynamic batch axis. Pass batches of size ≥ 1 from your client.
+- **Precise resize** — the 1280 input is downscaled to 800 inside the graph with an antialiased bicubic. Deriving the low-res pass from the 1280 image instead of the original changes the outputs by less than the CPU-vs-GPU noise of the same graph.
+- **Python from the repo root** — the repo's `triton/` folder shadows the `triton` package that torch's dynamo probes on import, which breaks `import torchvision` in an interactive `python` started at the repo root. Run the scripts as `python scripts/…`, or start Python from another directory.

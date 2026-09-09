@@ -6,7 +6,8 @@
 *.safetensors
 
 # Triton model weight directory (config.pbtxt is tracked; model.onnx is not)
-triton/model_repository/*/1/
+triton/model_repository/*/1/*
+!triton/model_repository/*/1/.gitkeep
 
 # Python
 __pycache__/

@@ -4,11 +4,14 @@ Usage:
     # Fast model (512x512, A->B only)
     python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg
 
-    # Bidirectional dense model at 640 (romav2_bidirectional_dense)
+    # Base model at 640 (romav2_bidirectional_dense)
     python scripts/triton_client.py A.jpg B.jpg --model romav2_bidirectional_dense --setting base
 
-    # Precise model (800 lr + 1280 hr inputs; both directions + precision outputs)
+    # Precise model (one 1280x1280 image per side; the graph resizes for its 800 pass)
     python scripts/triton_client.py A.jpg B.jpg --model romav2_precise_dense --setting precise --out result.png
+
+Every served RoMaV2 model has the same interface (img_A, img_B -> warp/overlap/precision
+for AB and BA); --setting only fixes the input size.
 
     # Custom server address
     python scripts/triton_client.py img_A.jpg img_B.jpg --url myserver:8000
@@ -24,7 +27,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts/ → visualize helpers
-from visualize import RESOLUTIONS, build_composite, prepare  # noqa: E402
+from visualize import INPUT_SIZES, build_composite, prepare  # noqa: E402
 
 
 def infer(
@@ -39,11 +42,11 @@ def infer(
 ) -> dict[str, np.ndarray]:
     """Run inference on a Triton HTTP endpoint.
 
-    The request carries the inputs the setting defines (see visualize.prepare) and asks
+    Sends img_A / img_B at the setting's input size (see visualize.prepare) and asks
     for every output the served model declares.  Returns them without the batch dim:
-        warp_*      (H, W, 2)     dense warp in normalised coords [-1, 1]
-        overlap_*   (H, W, 1)     overlap probability in [0, 1]
-        precision_* (H, W, 2, 2)  precision matrices (models exported with precision)
+        warp_*      (S, S, 2)     dense warp in normalised coords [-1, 1]
+        overlap_*   (S, S, 1)     overlap probability in [0, 1]
+        precision_* (S, S, 2, 2)  precision matrices
     """
     try:
         import tritonclient.http as httpclient
@@ -84,8 +87,8 @@ def main():
     parser.add_argument("img_b", help="Path to image B")
     parser.add_argument("--url",     default="localhost:8000", help="Triton HTTP endpoint")
     parser.add_argument("--model",   default="romav2", help="Model name registered in Triton")
-    parser.add_argument("--setting", default="fast", choices=list(RESOLUTIONS),
-                        help="setting the served model was exported with (fixes input resolution)")
+    parser.add_argument("--setting", default="fast", choices=list(INPUT_SIZES),
+                        help="setting the served model was exported with (fixes the input size)")
     parser.add_argument("--timeout", type=float, default=600.0, help="HTTP timeout in seconds")
     parser.add_argument("--out",     default=None, help="Save visualisation to this path (optional)")
     args = parser.parse_args()

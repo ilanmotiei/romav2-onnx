@@ -16,13 +16,12 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts/ → visualize helpers
-from visualize import RESOLUTIONS, prepare  # noqa: E402
+from visualize import INPUT_SIZES, prepare  # noqa: E402
 
 
 def _display_size(setting: str) -> int:
-    """Resolution the ensemble's matches refer to (the high-res one for two-stage settings)."""
-    H_lr, H_hr = RESOLUTIONS[setting]
-    return H_hr or H_lr
+    """Resolution the ensemble's matches refer to: the model's input size."""
+    return INPUT_SIZES[setting]
 
 
 def infer_sampled(
@@ -130,7 +129,7 @@ def main():
     parser.add_argument("img_b")
     parser.add_argument("--url", default="localhost:8000")
     parser.add_argument("--model", default="romav2_bidirectional_sampled")
-    parser.add_argument("--setting", default="base", choices=list(RESOLUTIONS),
+    parser.add_argument("--setting", default="base", choices=list(INPUT_SIZES),
                         help="setting the ensemble's dense model was exported with "
                              "(romav2_bidirectional_sampled: base/640, romav2_precise_sampled: precise)")
     parser.add_argument("--num-corresp", type=int, default=5000)
