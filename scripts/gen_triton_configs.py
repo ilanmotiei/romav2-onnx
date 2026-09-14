@@ -25,16 +25,10 @@ REPO = Path(__file__).resolve().parents[1] / "triton" / "model_repository"
 SAMPLER = "romav2_sampler"   # shared Python-backend model, hand-written (not generated)
 
 # setting -> (dense model name, sampled ensemble name, input size S, note for the dense config)
-# Only the settings deployed on modelhub are kept here (base + precise); the fast/turbo
-# exports still work but have no Triton entry.
+# Only the setting deployed on modelhub is kept here (base, 640). The turbo/fast/precise
+# exports still work but have no Triton entry; add a row here to deploy one.
 MODELS = {
     "base": ("romav2_bidirectional_dense", "romav2_bidirectional_sampled", 640, ""),
-    "precise": (
-        "romav2_precise_dense", "romav2_precise_sampled", 1280,
-        "# Precise: the graph resizes this 1280x1280 input down to the 800x800 low-res pass\n"
-        "# itself (antialiased bicubic, opset 18), then runs the 1280 refinement stage, so the\n"
-        "# client sends one image per side exactly like the other settings.\n",
-    ),
 }
 
 DENSE = '''name: "{name}"
@@ -99,7 +93,8 @@ instance_group [
 
 # Bound the ORT GPU arena: kSameAsRequested extends by exactly the requested size instead of
 # the default power-of-two doubling. The dense matcher emits huge 5-D warp/precision
-# volumes (and the precise setting's 1280 local-correlation window is ~3.9 GB per direction),
+# volumes (a 1280 precise export needed two 3.9 GB local-correlation buffers before the
+# per-offset rewrite in src/romav2/local_correlation.py),
 # so the default strategy over-allocates and the arena grows to swallow the shared 3090
 # (it never releases), starving the co-resident SAM3 encoder. This matches the SAM3
 # ONNX models' setting. (Distinct from the disabled TensorRT block below.)

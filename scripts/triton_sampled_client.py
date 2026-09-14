@@ -3,7 +3,7 @@
 Usage:
     python scripts/triton_sampled_client.py assets/toronto_A.jpg assets/toronto_B.jpg
     python scripts/triton_sampled_client.py A.jpg B.jpg --model romav2_bidirectional_sampled --setting base --out sampled.png
-    python scripts/triton_sampled_client.py A.jpg B.jpg --model romav2_precise_sampled --setting precise --out sampled.png
+    python scripts/triton_sampled_client.py A.jpg B.jpg --model romav2_bidirectional_sampled --setting base --out sampled.png
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ def main():
     parser.add_argument("--model", default="romav2_bidirectional_sampled")
     parser.add_argument("--setting", default="base", choices=list(INPUT_SIZES),
                         help="setting the ensemble's dense model was exported with "
-                             "(romav2_bidirectional_sampled: base/640, romav2_precise_sampled: precise)")
+                             "(romav2_bidirectional_sampled: base/640)")
     parser.add_argument("--num-corresp", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=-1,
                         help="Sampling seed; -1 uses non-deterministic sampling")

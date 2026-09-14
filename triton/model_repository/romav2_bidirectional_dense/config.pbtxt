@@ -60,7 +60,8 @@ instance_group [
 
 # Bound the ORT GPU arena: kSameAsRequested extends by exactly the requested size instead of
 # the default power-of-two doubling. The dense matcher emits huge 5-D warp/precision
-# volumes (and the precise setting's 1280 local-correlation window is ~3.9 GB per direction),
+# volumes (a 1280 precise export needed two 3.9 GB local-correlation buffers before the
+# per-offset rewrite in src/romav2/local_correlation.py),
 # so the default strategy over-allocates and the arena grows to swallow the shared 3090
 # (it never releases), starving the co-resident SAM3 encoder. This matches the SAM3
 # ONNX models' setting. (Distinct from the disabled TensorRT block below.)

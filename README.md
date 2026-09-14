@@ -181,12 +181,11 @@ Measured for `precise`, batch 1: RTX 3090 — ORT CUDA 1.0 s/pair, PyTorch CUDA 
 
 ### 5.1 Model repository
 
-Two Triton modules serve each deployed setting, and their `config.pbtxt` files are **generated from one template** so they differ only in name and input size. Only the settings deployed on modelhub are kept (base and precise); fast/turbo exports still work but have no Triton entry:
+Two Triton modules serve the deployed setting, and their `config.pbtxt` files are **generated from one template** so a setting is one row in `MODELS`. Only the setting deployed on modelhub is kept (base, 640); turbo/fast/precise exports still work but have no Triton entry:
 
 | Setting | Dense model (ONNX)            | Sampled ensemble               | `S`  |
 |---------|-------------------------------|--------------------------------|------|
 | base    | `romav2_bidirectional_dense`  | `romav2_bidirectional_sampled` | 640  |
-| precise | `romav2_precise_dense`        | `romav2_precise_sampled`       | 1280 |
 
 ```bash
 python scripts/gen_triton_configs.py          # regenerate after editing the template
@@ -200,7 +199,6 @@ Place the export as `model.onnx` in the dense model's version directory:
 
 ```bash
 cp romav2_base.onnx    triton/model_repository/romav2_bidirectional_dense/1/model.onnx
-cp romav2_precise.onnx triton/model_repository/romav2_precise_dense/1/model.onnx
 ```
 
 The generated configs target a GPU. For a CPU-only Docker run, change `kind: KIND_GPU` to `KIND_CPU` and delete the `optimization` and `parameters` blocks.
@@ -229,12 +227,10 @@ curl -X POST http://localhost:8000/v2/repository/index    # → every model READ
 # dense outputs + visualisation; --setting fixes the input size
 python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
     --url localhost:8000 --model romav2_bidirectional_dense --setting base --out result.png
-python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
-    --url localhost:8000 --model romav2_precise_dense --setting precise --out precise.png
 
 # sparse correspondences
 python scripts/triton_sampled_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
-    --url localhost:8000 --model romav2_precise_sampled --setting precise --num-corresp 5000
+    --url localhost:8000 --model romav2_bidirectional_sampled --setting base --num-corresp 5000
 ```
 
 The sampled ensemble returns:
@@ -254,10 +250,10 @@ Convert to pixels with `(p + 1) / 2 * S - 0.5`.
 from scripts.triton_client import infer
 
 outs = infer("path/to/image_A.jpg", "path/to/image_B.jpg",
-             url="localhost:8000", model_name="romav2_precise_dense", setting="precise")
-outs["warp_AB"]       # numpy (1280, 1280, 2)     normalised coords in [-1, 1]
-outs["overlap_AB"]    # numpy (1280, 1280, 1)     probability in [0, 1]
-outs["precision_AB"]  # numpy (1280, 1280, 2, 2)
+             url="localhost:8000", model_name="romav2_bidirectional_dense", setting="base")
+outs["warp_AB"]       # numpy (640, 640, 2)     normalised coords in [-1, 1]
+outs["overlap_AB"]    # numpy (640, 640, 1)     probability in [0, 1]
+outs["precision_AB"]  # numpy (640, 640, 2, 2)
 # ... and warp_BA / overlap_BA / precision_BA
 ```
 
@@ -282,8 +278,6 @@ romav2-onnx/
 │   └── model_repository/
 │       ├── romav2_bidirectional_dense/    # dense, base/640       (config generated)
 │       ├── romav2_bidirectional_sampled/  # ensemble, base/640    (config generated)
-│       ├── romav2_precise_dense/          # dense, precise/1280   (config generated)
-│       ├── romav2_precise_sampled/        # ensemble, precise/1280 (config generated)
 │       └── romav2_sampler/                # shared Python-backend sampler (model.py, sampler.py)
 │           (each */1/ holds model.onnx, gitignored, or an empty .gitkeep)
 └── assets/

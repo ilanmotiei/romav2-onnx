@@ -8,7 +8,7 @@ Usage:
     python scripts/triton_client.py A.jpg B.jpg --model romav2_bidirectional_dense --setting base
 
     # Precise model (one 1280x1280 image per side; the graph resizes for its 800 pass)
-    python scripts/triton_client.py A.jpg B.jpg --model romav2_precise_dense --setting precise --out result.png
+    python scripts/triton_client.py A.jpg B.jpg --model romav2_bidirectional_dense --setting base --out result.png
 
 Every served RoMaV2 model has the same interface (img_A, img_B -> warp/overlap/precision
 for AB and BA); --setting only fixes the input size.
