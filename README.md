@@ -83,7 +83,7 @@ The script:
 - Switches the B→A pass on for every setting (upstream only does so for `precise`)
 - Uses the classic TorchScript-based JIT tracer (`dynamo=False`) at opset 18
 - Bakes `S` into the graph; only the batch dimension is dynamic
-- For `precise`, traces the 1280→800 resize as a plain bicubic `Resize` and then patches those two nodes to the antialiased PIL-style cubic (`antialias=1`, coefficient −0.5), which ONNX Runtime reproduces to ~1e-5 of torch's. This is why opset 18 is required.
+- For `precise`, the 1280→800 downscale is emitted as a fixed separable gather (indices and weights read off torch's own antialiased bicubic, exact to 2e-7) rather than an ONNX `Resize`: ONNX Runtime 1.22's CUDA kernel for `Resize(antialias=1)`, the runtime inside Triton 25.07, returns wrong pixels (mean error 0.19 on [0, 1] images), while Gather and elementwise ops are exact on every provider.
 
 Add `--trt` to bake the RoPE tables to constants so TensorRT can parse the backbone (see `bake_rope_for_trt` in the script). `--bidirectional` and `--include-precision` are still accepted for old command lines but are implied.
 
@@ -126,7 +126,7 @@ Expected output (precise, laptop CPU):
 Validation passed — PyTorch and ONNX agree wherever the images overlap.
 ```
 
-> **Why not a global tolerance?** Wherever the two images do not overlap, the matcher's softmax at temperature 0.1 turns float32 rounding into arbitrarily different warps and precisions: on real images the unmasked warp max is ~0.15–0.7 while the confident pixels agree to ~0.01, and PyTorch CPU vs PyTorch CUDA differ just as much in those regions. Random inputs are unmatched everywhere, so they cannot be used either. The precise export's in-graph antialiased Resize matches torch's to 1e-4 in the interior (2e-2 on the 4-pixel border, a known ORT-vs-torch edge-handling difference) and does not change the picture.
+> **Why not a global tolerance?** Wherever the two images do not overlap, the matcher's softmax at temperature 0.1 turns float32 rounding into arbitrarily different warps and precisions: on real images the unmasked warp max is ~0.15–0.7 while the confident pixels agree to ~0.01, and PyTorch CPU vs PyTorch CUDA differ just as much in those regions. Random inputs are unmatched everywhere, so they cannot be used either. The precise export's in-graph downscale reproduces torch's antialiased bicubic to 2e-7 and does not change the picture.
 >
 > **GPU memory.** The native local-correlation path used to gather all 49 window offsets of the patch-4 refiner in one tensor; at the precise input size that is two 3.85 GB intermediates, a ~20 GB standalone peak, and a CUDA out-of-memory inside Triton next to the other models on a 24 GB card. `src/romav2/local_correlation.py` now samples one offset at a time (bit-identical result, K static so the batch axis stays dynamic); standalone the ORT CUDA peak drops to 9.0 GB with arena shrinkage enabled as in the Triton config (14.7 GB without it, because ORT adds its memory-pattern buffer on the second run), and with the other dense model loaded Triton settles at about 14.6 GB after precise requests.
 >
@@ -268,6 +268,35 @@ outs["precision_AB"]  # numpy (640, 640, 2, 2)
 # ... and warp_BA / overlap_BA / precision_BA
 ```
 
+### 5.5 Evaluate a deployment against the checkpoint
+
+`scripts/triton_eval.py` runs on the machine that hosts Triton. Phase one runs the PyTorch checkpoint on the GPU (scale Triton down first so the GPU is free) in two configurations, upstream defaults (AMP) and the fp32 export configuration, on the sample pairs of `benchmark.py`. Phase two sends the same inputs to the served module, compares where the checkpoint says the images overlap, and times the dense model and the sampled ensemble with medians over several runs; server-side times come from Triton's per-model statistics so they exclude HTTP transfer.
+
+```bash
+python scripts/triton_eval.py reference --setting precise --out bench_gpu/precise_ref.npz
+python scripts/triton_eval.py triton --setting precise --name romav2_precise --url localhost:8000 \
+    --ref bench_gpu/precise_ref.npz --out bench_gpu/precise_eval.json
+```
+
+Precise on crazypenguins (RTX 3090, Triton 25.07), Toronto A→B, confident pixels, warp in px of the 1280 input:
+
+| comparison | warp p99 | warp max | overlap mean diff | precision rel p99 |
+|---|---|---|---|---|
+| Triton vs fp32 checkpoint | 0.86 px | 53 px | 0.004 | 0.20 |
+| Triton vs upstream (AMP) | 3.1 px | 56 px | 0.013 | 0.68 |
+| fp32 vs upstream (noise floor) | 3.5 px | 40 px | 0.012 | 0.69 |
+
+The crop/rotate pairs agree to well under a pixel at p99. The deployment sits at the checkpoint's own AMP-vs-fp32 noise floor.
+
+| request | median | notes |
+|---|---|---|
+| dense, client wall | 1.33 s | HTTP, includes ~65 MB response |
+| dense, server compute | 1.15 s | torch fp32 forward 0.97 s, upstream AMP 0.74 s |
+| sampled, 1k / 3k / 10k | 1.16 / 1.17 / 1.28 s | sampler 51 / 63 / 161 ms |
+| sampled, 30k / 100k | 2.14 / 12.0 s | sampler 1.0 / 10.9 s: the balanced sampler's KDE is O((4N)²) |
+
+> **ONNX Runtime 1.22 (Triton 25.07) and antialiased Resize.** Its CUDA kernel for `Resize(antialias=1)` returns wrong pixels (against the CPU kernel: max error 1.0, mean 0.19 on [0, 1] images; ORT 1.26 is correct). A precise export using that node ran its low-res pass on a corrupted image inside Triton and drifted to a 12 px p99 against the checkpoint while looking fine in a newer standalone ORT. The export therefore emits the downscale as a constant-tap gather (§1) and `triton_eval.py` exists to catch this class of problem: always evaluate the served model, not just the file.
+
 **Triton result** (identical to direct ONNX):
 
 ![triton result](assets/triton_result.png)
@@ -284,7 +313,8 @@ romav2-onnx/
 │   ├── benchmark.py             # PyTorch vs ONNX Runtime timing + overlap-masked diffs
 │   ├── visualize.py             # Composite visualisation (ONNX or PyTorch); shared image helpers
 │   ├── triton_client.py         # Triton HTTP client for the dense models
-│   └── triton_sampled_client.py # Triton HTTP client for the sampled ensembles
+│   ├── triton_sampled_client.py # Triton HTTP client for the sampled ensembles
+│   └── triton_eval.py           # Served module vs checkpoint: masked accuracy + median timings
 ├── triton/
 │   └── model_repository/
 │       ├── romav2_bidirectional_dense/    # dense, base/640       (config generated)
@@ -305,5 +335,5 @@ romav2-onnx/
 - **Float32 only** — all AMP/bfloat16 paths are disabled at export time; the full graph runs in float32 for ORT compatibility.
 - **Static `S`** — the input size is baked into the ONNX graph per setting. Export a separate `.onnx` per setting if you need multiple resolutions.
 - **Batch dimension** — the Triton configs use `max_batch_size: 0` with an explicit batch dim in `dims`, matching the ONNX model's dynamic batch axis. Pass batches of size ≥ 1 from your client.
-- **Precise resize** — the 1280 input is downscaled to 800 inside the graph with an antialiased bicubic. Deriving the low-res pass from the 1280 image instead of the original changes the outputs by less than the CPU-vs-GPU noise of the same graph.
+- **Precise resize** — the 1280 input is downscaled to 800 inside the graph with the same antialiased bicubic as upstream, written as a gather with constant taps so no provider-specific `Resize` kernel is involved. Deriving the low-res pass from the 1280 image instead of the original changes the outputs by less than the CPU-vs-GPU noise of the same graph.
 - **Python from the repo root** — the repo's `triton/` folder shadows the `triton` package that torch's dynamo probes on import, which breaks `import torchvision` in an interactive `python` started at the repo root. Run the scripts as `python scripts/…`, or start Python from another directory.

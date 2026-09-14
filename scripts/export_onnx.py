@@ -10,9 +10,10 @@ input size S (320 turbo / 512 fast / 640 base / 1280 precise):
              warp_BA, overlap_BA, precision_BA   (same, B -> A)
 
 Two-stage settings (precise) take the 1280x1280 image and derive the 800x800
-low-res pass INSIDE the graph with an antialiased bicubic Resize -- the same
-filter RoMaV2.match() applies -- so the client sends one image per side like
-every other setting.  That needs ONNX opset >= 18 (Resize "antialias").
+low-res pass INSIDE the graph -- the same antialiased bicubic filter
+RoMaV2.match() applies, expressed as a fixed separable gather (see _Resize) so
+that every ONNX Runtime provider computes it exactly -- and the client sends one
+image per side like every other setting.
 
 The export writes the model straight into the Triton model repository and, in
 the same pass, the config.pbtxt of the dense model and of the sampled ensemble
@@ -65,28 +66,61 @@ _CPU = torch.device("cpu")
 INPUT_NAMES = ["img_A", "img_B"]
 OUTPUT_NAMES = ["warp_AB", "overlap_AB", "precision_AB",
                 "warp_BA", "overlap_BA", "precision_BA"]
-MIN_OPSET_TWO_STAGE = 18   # Resize gained the `antialias` attribute in opset 18
 
 
 # ── Wrapper ──────────────────────────────────────────────────────────────────
 
 class _Resize(nn.Module):
-    """Bicubic resize to a fixed size, matching RoMaV2.match()'s antialiased bicubic.
+    """RoMaV2.match()'s antialiased bicubic downscale as a fixed separable gather.
 
-    In eager mode (validation, benchmarks, the RoPE dry run) this IS the upstream
-    call.  The TorchScript exporter has no symbolic for the antialiased kernel, so
-    while tracing we emit the plain bicubic Resize and `patch_antialias()` turns
-    it into the antialiased PIL-style cubic (coefficient -0.5) after export --
-    ONNX Runtime's implementation matches torch's to ~1e-5.
+    The filter taps are read off torch's own ``F.interpolate(mode="bicubic",
+    antialias=True)`` (PIL-style cubic, coefficient -0.5), so the eager result
+    equals the upstream call to float precision and the traced graph carries
+    Gather / Mul / ReduceSum with constant indices and weights instead of a
+    Resize node.  That matters because ONNX Runtime 1.22's CUDA kernel for
+    ``Resize(antialias=1)`` -- the runtime inside Triton 25.07 -- returns wrong
+    pixels (mean |error| 0.19 on [0, 1] images; fixed by 1.26), whereas Gather
+    and elementwise ops agree across providers to 1e-7.
     """
 
-    def __init__(self, H: int, W: int) -> None:
+    def __init__(self, in_hw: tuple[int, int], out_hw: tuple[int, int]):
         super().__init__()
-        self.size = (H, W)
+        self.size = tuple(out_hw)
+        for axis, n_in, n_out in (("h", in_hw[0], out_hw[0]), ("w", in_hw[1], out_hw[1])):
+            idx, wts = _resize_taps(n_in, n_out)
+            self.register_buffer(f"idx_{axis}", idx, persistent=False)
+            self.register_buffer(f"w_{axis}", wts, persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.interpolate(x, size=self.size, mode="bicubic", align_corners=False,
-                             antialias=not torch.jit.is_tracing())
+    @staticmethod
+    def _along_last(x: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        n_out, K = idx.shape
+        taps = x.index_select(-1, idx.reshape(-1)).unflatten(-1, (n_out, K))   # (..., n_out, K)
+        return (taps * wts).sum(-1)                                            # (..., n_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:              # (B, C, H_in, W_in)
+        x = self._along_last(x, self.idx_w, self.w_w)                # (B, C, H_in, W_out)
+        x = self._along_last(x.transpose(-1, -2), self.idx_h, self.w_h)   # (B, C, W_out, H_out)
+        return x.transpose(-1, -2).contiguous()                      # (B, C, H_out, W_out)
+
+
+def _resize_taps(n_in: int, n_out: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Indices and weights (n_out, K) of torch's antialiased bicubic 1-D resample
+    from n_in to n_out samples:  out[r] = sum_k w[r, k] * in[idx[r, k]]."""
+    # Resample an identity image along one axis only (the other axis keeps its
+    # size, which is an exact identity): the result IS the filter matrix.  A
+    # 1-pixel-wide basis would not do -- torch skips its antialias kernel then.
+    eye = torch.eye(n_in)[None, None]                                # (1, 1, n_in, n_in)
+    W = F.interpolate(eye, size=(n_out, n_in), mode="bicubic",
+                      align_corners=False, antialias=True)[0, 0]    # (n_out, n_in)
+    nz = W != 0
+    K = int(nz.sum(1).max())
+    idx = torch.zeros(n_out, K, dtype=torch.long)
+    wts = torch.zeros(n_out, K)
+    for r in range(n_out):
+        cols = nz[r].nonzero().flatten()
+        idx[r, : len(cols)] = cols
+        wts[r, : len(cols)] = W[r, cols]
+    return idx, wts
 
 
 class RoMaV2OnnxWrapper(nn.Module):
@@ -104,7 +138,7 @@ class RoMaV2OnnxWrapper(nn.Module):
         self.model = model
         self.two_stage = model.H_hr is not None
         if self.two_stage:
-            self.resize_lr = _Resize(model.H_lr, model.W_lr)
+            self.resize_lr = _Resize((model.H_hr, model.W_hr), (model.H_lr, model.W_lr))
             self.input_hw = (model.H_hr, model.W_hr)
         else:
             self.input_hw = (model.H_lr, model.W_lr)
@@ -279,40 +313,6 @@ def bake_rope_for_trt(wrapper: RoMaV2OnnxWrapper, H: int, W: int) -> int:
     return len(rope_mods)
 
 
-# ── In-graph resize: antialias patch ─────────────────────────────────────────
-
-def patch_antialias(onnx_path: str) -> int:
-    """Turn the wrapper's traced plain-bicubic Resize nodes into antialiased ones.
-
-    Only nodes traced from ``_Resize`` (scope ``/resize_lr``) are touched; the
-    model's own bilinear upsamplers are left alone.  Coefficient -0.5 with
-    antialias=1 is the PIL-style cubic that torch's antialiased bicubic uses.
-    Returns the number of patched nodes (2: image A and image B).
-    """
-    import onnx
-    from onnx import helper
-
-    model = onnx.load(onnx_path, load_external_data=False)
-    opset = next(o.version for o in model.opset_import if o.domain in ("", "ai.onnx"))
-    if opset < MIN_OPSET_TWO_STAGE:
-        raise RuntimeError(f"Resize antialias needs opset >= {MIN_OPSET_TWO_STAGE}, model has {opset}")
-    patched = 0
-    for node in model.graph.node:
-        if node.op_type != "Resize" or "/resize_lr" not in node.name:
-            continue
-        attrs = {a.name: helper.get_attribute_value(a) for a in node.attribute}
-        if attrs.get("mode") != b"cubic":
-            raise RuntimeError(f"unexpected Resize mode on {node.name}: {attrs.get('mode')}")
-        attrs.update(cubic_coeff_a=-0.5, antialias=1)
-        del node.attribute[:]
-        node.attribute.extend(helper.make_attribute(k, v) for k, v in attrs.items())
-        patched += 1
-    if patched != 2:
-        raise RuntimeError(f"expected 2 in-graph resize nodes to patch, found {patched}")
-    onnx.save(model, onnx_path)
-    return patched
-
-
 # ── Export ───────────────────────────────────────────────────────────────────
 
 def default_output(setting: str, triton_name: str = DEFAULT_NAME) -> Path:
@@ -338,9 +338,6 @@ def export(
     output_path = Path(output_path) if output_path else default_output(setting, triton_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wrapper = build_model(setting)
-    if wrapper.two_stage and opset < MIN_OPSET_TWO_STAGE:
-        raise SystemExit(f"setting '{setting}' resizes in-graph and needs --opset >= {MIN_OPSET_TWO_STAGE}")
-
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
 
     if trt:
@@ -370,10 +367,6 @@ def export(
             # path handles the model's Python-driven loops more gracefully.
             dynamo=False,
         )
-
-    if wrapper.two_stage:
-        n = patch_antialias(output_path)
-        print(f"Patched {n} in-graph Resize node(s) to antialiased bicubic.")
 
     print(f"Saved → {output_path}")
 
@@ -559,7 +552,7 @@ if __name__ == "__main__":
                         help="model setting (fixes the input size; precise resizes "
                              "its 800x800 low-res pass in-graph from the 1280 input)")
     parser.add_argument("--opset",    type=int, default=18,
-                        help="ONNX opset version (>= 18 required for precise)")
+                        help="ONNX opset version")
     parser.add_argument("--trt", action="store_true",
                         help="bake RoPE to constants so the graph is "
                              "TensorRT-parseable (removes If/Range)")

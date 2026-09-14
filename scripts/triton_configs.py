@@ -30,7 +30,7 @@ SIZES = {"turbo": 320, "fast": 512, "base": 640, "precise": 1280}   # input size
 NOTES = {
     "precise": (
         "# Precise: the graph resizes this 1280x1280 input down to the 800x800 low-res pass\n"
-        "# itself (antialiased bicubic, opset 18), then runs the 1280 refinement stage, so the\n"
+        "# itself (antialiased bicubic as a constant-tap gather), then runs the 1280 refinement stage, so the\n"
         "# client sends one image per side exactly like the other settings.\n"
     ),
 }
