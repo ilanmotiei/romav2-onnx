@@ -181,11 +181,10 @@ Measured for `precise`, batch 1: RTX 3090 — ORT CUDA 1.0 s/pair, PyTorch CUDA 
 
 ### 5.1 Model repository
 
-Two Triton modules serve every setting, and their `config.pbtxt` files are **generated from one template** so they differ only in name and input size:
+Two Triton modules serve each deployed setting, and their `config.pbtxt` files are **generated from one template** so they differ only in name and input size. Only the settings deployed on modelhub are kept (base and precise); fast/turbo exports still work but have no Triton entry:
 
 | Setting | Dense model (ONNX)            | Sampled ensemble               | `S`  |
 |---------|-------------------------------|--------------------------------|------|
-| fast    | `romav2`                      | `romav2_sampled`               | 512  |
 | base    | `romav2_bidirectional_dense`  | `romav2_bidirectional_sampled` | 640  |
 | precise | `romav2_precise_dense`        | `romav2_precise_sampled`       | 1280 |
 
@@ -200,7 +199,7 @@ python scripts/gen_triton_configs.py --check  # CI-style drift check
 Place the export as `model.onnx` in the dense model's version directory:
 
 ```bash
-cp romav2_fast.onnx    triton/model_repository/romav2/1/model.onnx
+cp romav2_base.onnx    triton/model_repository/romav2_bidirectional_dense/1/model.onnx
 cp romav2_precise.onnx triton/model_repository/romav2_precise_dense/1/model.onnx
 ```
 
@@ -229,7 +228,7 @@ curl -X POST http://localhost:8000/v2/repository/index    # → every model READ
 ```bash
 # dense outputs + visualisation; --setting fixes the input size
 python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
-    --url localhost:8000 --model romav2 --setting fast --out result.png
+    --url localhost:8000 --model romav2_bidirectional_dense --setting base --out result.png
 python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg \
     --url localhost:8000 --model romav2_precise_dense --setting precise --out precise.png
 
@@ -281,8 +280,6 @@ romav2-onnx/
 │   └── triton_sampled_client.py # Triton HTTP client for the sampled ensembles
 ├── triton/
 │   └── model_repository/
-│       ├── romav2/                        # dense, fast/512       (config generated)
-│       ├── romav2_sampled/                # ensemble, fast/512    (config generated)
 │       ├── romav2_bidirectional_dense/    # dense, base/640       (config generated)
 │       ├── romav2_bidirectional_sampled/  # ensemble, base/640    (config generated)
 │       ├── romav2_precise_dense/          # dense, precise/1280   (config generated)

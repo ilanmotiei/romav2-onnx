@@ -86,8 +86,8 @@ def main():
     parser.add_argument("img_a", help="Path to image A")
     parser.add_argument("img_b", help="Path to image B")
     parser.add_argument("--url",     default="localhost:8000", help="Triton HTTP endpoint")
-    parser.add_argument("--model",   default="romav2", help="Model name registered in Triton")
-    parser.add_argument("--setting", default="fast", choices=list(INPUT_SIZES),
+    parser.add_argument("--model",   default="romav2_bidirectional_dense", help="Model name registered in Triton")
+    parser.add_argument("--setting", default="base", choices=list(INPUT_SIZES),
                         help="setting the served model was exported with (fixes the input size)")
     parser.add_argument("--timeout", type=float, default=600.0, help="HTTP timeout in seconds")
     parser.add_argument("--out",     default=None, help="Save visualisation to this path (optional)")
