@@ -1,12 +1,14 @@
-"""Generate the Triton model repository from one template per module.
+"""Triton config templates for the RoMaV2 module.
 
-Every RoMaV2 setting is served through the same two Triton modules -- a dense
-ONNX model and a sampled ensemble on top of the shared python sampler -- so the
-per-setting config.pbtxt files differ only in their name and input size.  They
-are generated here rather than hand-edited so they cannot drift apart.
+One dense ONNX model plus one sampled ensemble (on top of the shared python
+sampler) serve RoMaV2; the module is the same for every setting and only the
+input size S differs.  `scripts/export_onnx.py` writes both config.pbtxt files
+in the same pass as the model, so the repository always describes the model
+that was exported last:
 
-    python scripts/gen_triton_configs.py            # (re)write triton/model_repository/*/config.pbtxt
-    python scripts/gen_triton_configs.py --check    # exit 1 if any file is out of date
+    python scripts/export_onnx.py --setting base            # model + configs
+    python scripts/triton_configs.py --setting base          # configs only
+    python scripts/triton_configs.py --setting base --check  # exit 1 if out of date
 
 Interface (identical for every setting, see scripts/export_onnx.py):
     inputs   img_A, img_B            FP32 [batch, 3, S, S]
@@ -22,13 +24,15 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1] / "triton" / "model_repository"
-SAMPLER = "romav2_sampler"   # shared Python-backend model, hand-written (not generated)
-
-# setting -> (dense model name, sampled ensemble name, input size S, note for the dense config)
-# Only the setting deployed on modelhub is kept here (base, 640). The turbo/fast/precise
-# exports still work but have no Triton entry; add a row here to deploy one.
-MODELS = {
-    "base": ("romav2_bidirectional_dense", "romav2_bidirectional_sampled", 640, ""),
+SAMPLER = "romav2_sampler"          # shared Python-backend model, hand-written (not generated)
+DEFAULT_NAME = "romav2_bidirectional"   # dense model <name>_dense, ensemble <name>_sampled
+SIZES = {"turbo": 320, "fast": 512, "base": 640, "precise": 1280}   # input size S per setting
+NOTES = {
+    "precise": (
+        "# Precise: the graph resizes this 1280x1280 input down to the 800x800 low-res pass\n"
+        "# itself (antialiased bicubic, opset 18), then runs the 1280 refinement stage, so the\n"
+        "# client sends one image per side exactly like the other settings.\n"
+    ),
 }
 
 DENSE = '''name: "{name}"
@@ -36,7 +40,7 @@ platform: "onnxruntime_onnx"
 max_batch_size: 0
 
 # RoMaV2 dense matcher, "{setting}" setting. Same module for every setting; only the
-# input size differs (see scripts/gen_triton_configs.py). Export with
+# input size differs. Written by the export together with the model:
 #   python scripts/export_onnx.py --setting {setting}
 {note}input [
   {{
@@ -312,40 +316,71 @@ ensemble_scheduling {{
 '''
 
 
-def render() -> dict[Path, str]:
-    files: dict[Path, str] = {}
-    for setting, (name, sampled, size, note) in MODELS.items():
-        files[REPO / name / "config.pbtxt"] = DENSE.format(name=name, setting=setting, size=size, note=note)
-        files[REPO / sampled / "config.pbtxt"] = SAMPLED.format(name=name, sampled=sampled, setting=setting, size=size)
-    return files
+def model_names(name: str = DEFAULT_NAME) -> tuple[str, str]:
+    """(dense model name, sampled ensemble name) for a Triton module name."""
+    return f"{name}_dense", f"{name}_sampled"
+
+
+def render(setting: str, size: int | None = None, name: str = DEFAULT_NAME,
+           repo: Path = REPO) -> dict[Path, str]:
+    """config.pbtxt path -> text for the dense model and the sampled ensemble."""
+    size = SIZES[setting] if size is None else size
+    dense, sampled = model_names(name)
+    return {
+        repo / dense / "config.pbtxt": DENSE.format(
+            name=dense, setting=setting, size=size, note=NOTES.get(setting, "")),
+        repo / sampled / "config.pbtxt": SAMPLED.format(
+            name=dense, sampled=sampled, setting=setting, size=size),
+    }
+
+
+def write_triton_configs(setting: str, size: int | None = None, name: str = DEFAULT_NAME,
+                         repo: Path = REPO) -> list[Path]:
+    """Write both configs (and the version-dir placeholders); returns the paths written."""
+    written = []
+    for path, text in render(setting, size, name, repo).items():
+        (path.parent / "1").mkdir(parents=True, exist_ok=True)
+        (path.parent / "1" / ".gitkeep").touch()
+        path.write_text(text)
+        written.append(path)
+    return written
+
+
+def check_triton_configs(setting: str, size: int | None = None, name: str = DEFAULT_NAME,
+                         repo: Path = REPO) -> list[str]:
+    """Problems that make the repository differ from what an export would write."""
+    problems = []
+    for path, text in render(setting, size, name, repo).items():
+        if not path.exists():
+            problems.append(f"missing: {path.relative_to(repo.parent.parent)}")
+        elif path.read_text() != text:
+            problems.append(f"out of date: {path.relative_to(repo.parent.parent)}")
+    expected = set(model_names(name)) | {SAMPLER}
+    for d in sorted(repo.iterdir()):
+        if d.is_dir() and d.name not in expected:
+            problems.append(f"unexpected model directory: {d.name}")
+    return problems
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--check", action="store_true", help="verify files are up to date instead of writing")
+    parser.add_argument("--setting", required=True, choices=list(SIZES),
+                        help="setting the repository should describe (fixes the input size)")
+    parser.add_argument("--name", default=DEFAULT_NAME,
+                        help=f"Triton module name; models are <name>_dense and <name>_sampled "
+                             f"(default {DEFAULT_NAME})")
+    parser.add_argument("--check", action="store_true",
+                        help="verify the repository instead of writing it")
     args = parser.parse_args()
-
-    stale = []
-    for path, text in render().items():
-        if args.check:
-            if not path.exists() or path.read_text() != text:
-                stale.append(path)
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        (path.parent / "1").mkdir(exist_ok=True)
-        (path.parent / "1" / ".gitkeep").touch()
-        path.write_text(text)
-        print(f"wrote {path.relative_to(REPO.parents[1])}")
     if args.check:
-        expected = {p.parent.name for p in render()} | {SAMPLER}
-        extra = sorted(d.name for d in REPO.iterdir() if d.is_dir() and d.name not in expected)
-        if extra:
-            print("not generated by this script (delete or add to MODELS):\n  " + "\n  ".join(extra))
-            stale.extend(REPO / d for d in extra)
-        if stale:
-            print("out of date:\n  " + "\n  ".join(str(p.relative_to(REPO.parents[1])) for p in stale))
+        problems = check_triton_configs(args.setting, name=args.name)
+        if problems:
+            print("\n".join(problems))
             sys.exit(1)
-        print("all Triton configs up to date")
+        print(f"Triton configs up to date for setting '{args.setting}'.")
+        return
+    for path in write_triton_configs(args.setting, name=args.name):
+        print(f"wrote {path.relative_to(REPO.parent.parent)}")
 
 
 if __name__ == "__main__":

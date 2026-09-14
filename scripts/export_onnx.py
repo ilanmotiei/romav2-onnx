@@ -14,16 +14,25 @@ low-res pass INSIDE the graph with an antialiased bicubic Resize -- the same
 filter RoMaV2.match() applies -- so the client sends one image per side like
 every other setting.  That needs ONNX opset >= 18 (Resize "antialias").
 
+The export writes the model straight into the Triton model repository and, in
+the same pass, the config.pbtxt of the dense model and of the sampled ensemble
+for that input size (see scripts/triton_configs.py), so the repository always
+describes the model that was exported last:
+
+    triton/model_repository/romav2_bidirectional_dense/1/model.onnx
+    triton/model_repository/romav2_bidirectional_dense/config.pbtxt
+    triton/model_repository/romav2_bidirectional_sampled/config.pbtxt
+
 Usage:
-    python scripts/export_onnx.py --setting fast    --output romav2_fast.onnx
-    python scripts/export_onnx.py --setting base    --output romav2_base.onnx
-    python scripts/export_onnx.py --setting precise --output romav2_precise.onnx
+    python scripts/export_onnx.py --setting base                  # -> model repository
+    python scripts/export_onnx.py --setting precise               # same module, 1280 input
+    python scripts/export_onnx.py --setting fast --output romav2_fast.onnx   # elsewhere
 
     # TensorRT-ready (bakes RoPE -> no If/Range so TensorRT can parse the graph):
-    python scripts/export_onnx.py --setting base --trt --output romav2_base_trt.onnx
+    python scripts/export_onnx.py --setting base --trt
 
-    # Validate an already-exported model against PyTorch on CPU:
-    python scripts/export_onnx.py --validate romav2_precise.onnx --setting precise
+    # Validate an exported model against PyTorch on CPU:
+    python scripts/export_onnx.py --validate romav2_fast.onnx --setting fast
 """
 
 from __future__ import annotations
@@ -47,6 +56,9 @@ from romav2.features import Descriptor, FineFeatures
 from romav2.matcher import Matcher
 from romav2.refiner import Refiners
 from romav2.romav2 import RoMaV2, _map_confidence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from triton_configs import DEFAULT_NAME, REPO as TRITON_REPO, SIZES, model_names, write_triton_configs
 
 _CPU = torch.device("cpu")
 
@@ -303,12 +315,28 @@ def patch_antialias(onnx_path: str) -> int:
 
 # ── Export ───────────────────────────────────────────────────────────────────
 
+def default_output(setting: str, triton_name: str = DEFAULT_NAME) -> Path:
+    """Where the export lands by default: the dense model's version directory."""
+    return TRITON_REPO / model_names(triton_name)[0] / "1" / "model.onnx"
+
+
 def export(
-    output_path: str = "romav2_fast.onnx",
-    setting: str = "fast",
+    output_path: str | Path | None = None,
+    setting: str = "base",
     opset: int = 18,
     trt: bool = False,
-) -> None:
+    triton_name: str = DEFAULT_NAME,
+    triton_configs: bool = True,
+) -> Path:
+    """Export one setting to ONNX and write the matching Triton configs.
+
+    With ``output_path`` unset the model goes to the dense model's version
+    directory in the Triton repository.  ``triton_configs`` writes the dense
+    and sampled config.pbtxt for this setting's input size in the same pass
+    (the repository holds one module, so the last export wins).
+    """
+    output_path = Path(output_path) if output_path else default_output(setting, triton_name)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     wrapper = build_model(setting)
     if wrapper.two_stage and opset < MIN_OPSET_TWO_STAGE:
         raise SystemExit(f"setting '{setting}' resizes in-graph and needs --opset >= {MIN_OPSET_TWO_STAGE}")
@@ -348,6 +376,16 @@ def export(
         print(f"Patched {n} in-graph Resize node(s) to antialiased bicubic.")
 
     print(f"Saved → {output_path}")
+
+    if triton_configs:
+        size = wrapper.input_hw[0]
+        assert size == SIZES[setting], f"triton_configs.SIZES[{setting!r}] != exported size {size}"
+        for path in write_triton_configs(setting, size, triton_name):
+            print(f"Wrote  → {path}")
+        dense_dir = TRITON_REPO / model_names(triton_name)[0]
+        if output_path.resolve() != (dense_dir / "1" / "model.onnx").resolve():
+            print(f"note: Triton expects the model at {dense_dir / '1' / 'model.onnx'}")
+    return output_path
 
 
 # ── Validate ─────────────────────────────────────────────────────────────────
@@ -513,9 +551,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export or validate RoMaV2 ONNX model")
     parser.add_argument("--validate", metavar="ONNX_PATH",
                         help="path to .onnx file to validate (skips export)")
-    parser.add_argument("--output",   default="romav2_fast.onnx",
-                        help="output .onnx path")
-    parser.add_argument("--setting",  default="fast",
+    parser.add_argument("--output",   default=None,
+                        help="output .onnx path (default: the dense model's version "
+                             "directory in triton/model_repository)")
+    parser.add_argument("--setting",  default="base",
                         choices=["turbo", "fast", "base", "precise"],
                         help="model setting (fixes the input size; precise resizes "
                              "its 800x800 low-res pass in-graph from the 1280 input)")
@@ -524,6 +563,11 @@ if __name__ == "__main__":
     parser.add_argument("--trt", action="store_true",
                         help="bake RoPE to constants so the graph is "
                              "TensorRT-parseable (removes If/Range)")
+    parser.add_argument("--triton-name", default=DEFAULT_NAME,
+                        help=f"Triton module name: models <name>_dense and <name>_sampled "
+                             f"(default {DEFAULT_NAME})")
+    parser.add_argument("--no-triton-configs", action="store_true",
+                        help="export only; do not (re)write the Triton config.pbtxt files")
     parser.add_argument("--img-a", default=str(DEFAULT_PAIR[0]),
                         help="(--validate) image A, resized like RoMaV2.match() does")
     parser.add_argument("--img-b", default=str(DEFAULT_PAIR[1]),
@@ -544,4 +588,5 @@ if __name__ == "__main__":
         validate(args.validate, setting=args.setting,
                  img_a=args.img_a, img_b=args.img_b, warp_atol=args.warp_atol)
     else:
-        export(args.output, setting=args.setting, opset=args.opset, trt=args.trt)
+        export(args.output, setting=args.setting, opset=args.opset, trt=args.trt,
+               triton_name=args.triton_name, triton_configs=not args.no_triton_configs)

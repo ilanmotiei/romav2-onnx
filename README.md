@@ -53,10 +53,12 @@ The modified `romav2` source is embedded directly in `src/` — no separate clon
 Every setting exports the **same module**: one image per side in, both directions plus precision out. Settings differ only in the input size `S`.
 
 ```bash
-python scripts/export_onnx.py --setting fast    --output romav2_fast.onnx      # 512×512
-python scripts/export_onnx.py --setting base    --output romav2_base.onnx      # 640×640
-python scripts/export_onnx.py --setting precise --output romav2_precise.onnx   # 1280×1280
+python scripts/export_onnx.py --setting base                                  # 640×640  → Triton repository
+python scripts/export_onnx.py --setting precise                               # 1280×1280 (same module)
+python scripts/export_onnx.py --setting fast --output romav2_fast.onnx        # 512×512 → a file elsewhere
 ```
+
+By default the export lands in the Triton model repository as `triton/model_repository/romav2_bidirectional_dense/1/model.onnx`, and **the same pass writes the Triton configs** (`config.pbtxt` of the dense model and of the sampled ensemble) for that setting's input size — see [§5.1](#51-model-repository). The repository holds one module, so the setting you export last is the one Triton serves. `--output` writes the model somewhere else (the configs are still written; `--no-triton-configs` skips them), `--triton-name` changes the module name (`<name>_dense`, `<name>_sampled`).
 
 | Setting   | Input size `S` | What runs                                                     |
 |-----------|----------------|---------------------------------------------------------------|
@@ -92,7 +94,8 @@ Add `--trt` to bake the RoPE tables to constants so TensorRT can parse the backb
 Runs the PyTorch model and the exported ONNX model on the bundled Toronto pair (resized exactly like `RoMaV2.match()` does, on CPU for both) and compares them where the comparison is meaningful. Pass the same `--setting` used at export; the check refuses models with a different interface.
 
 ```bash
-python scripts/export_onnx.py --validate romav2_fast.onnx    --setting fast
+python scripts/export_onnx.py --validate triton/model_repository/romav2_bidirectional_dense/1/model.onnx --setting base
+python scripts/export_onnx.py --validate romav2_fast.onnx    --setting fast      # an export made with --output
 python scripts/export_onnx.py --validate romav2_precise.onnx --setting precise
 # other images: --img-a path --img-b path; stricter/looser warp limit: --warp-atol
 ```
@@ -181,24 +184,32 @@ Measured for `precise`, batch 1: RTX 3090 — ORT CUDA 1.0 s/pair, PyTorch CUDA 
 
 ### 5.1 Model repository
 
-Two Triton modules serve the deployed setting, and their `config.pbtxt` files are **generated from one template** so a setting is one row in `MODELS`. Only the setting deployed on modelhub is kept (base, 640); turbo/fast/precise exports still work but have no Triton entry:
+Two Triton modules serve RoMaV2, and their `config.pbtxt` files are **written by the export** (from the templates in `scripts/triton_configs.py`) so they can never disagree with the model beside them:
 
-| Setting | Dense model (ONNX)            | Sampled ensemble               | `S`  |
-|---------|-------------------------------|--------------------------------|------|
-| base    | `romav2_bidirectional_dense`  | `romav2_bidirectional_sampled` | 640  |
+| Model                          | Kind                 | Inputs                                   |
+|--------------------------------|----------------------|------------------------------------------|
+| `romav2_bidirectional_dense`   | ONNX (dense)         | `img_A`, `img_B` `[-1, 3, S, S]`          |
+| `romav2_bidirectional_sampled` | ensemble             | same + `num_corresp`, `seed` `INT64 [1]` |
+| `romav2_sampler`               | Python backend       | (internal, shared)                       |
+
+`S` is the input size of the setting exported last (`base` → 640, `precise` → 1280, ...). Triton ONNX inputs have fixed dims, so switching setting means re-exporting; the export rewrites both configs.
 
 ```bash
-python scripts/gen_triton_configs.py          # regenerate after editing the template
-python scripts/gen_triton_configs.py --check  # CI-style drift check
+python scripts/export_onnx.py --setting base                  # model.onnx + both configs
+python scripts/triton_configs.py --setting base               # rewrite the configs only
+python scripts/triton_configs.py --setting base --check       # exit 1 if the repository drifted
 ```
 
 - **Dense model:** `img_A`, `img_B` `[-1, 3, S, S]` → the six outputs above. GPU instance, bounded CUDA arena and arena shrinkage so it coexists with other models on one GPU.
 - **Sampled ensemble:** same inputs plus `num_corresp` and `seed` (`INT64 [1]`); chains the dense model into `romav2_sampler`, a Triton Python backend implementation of RoMaV2's `sample()` (CuPy on GPU, NumPy fallback). Returns sparse correspondences instead of dense `S×S` tensors — use this from clients that just want matches.
 
-Place the export as `model.onnx` in the dense model's version directory:
+Layout after an export (`model.onnx` is gitignored):
 
-```bash
-cp romav2_base.onnx    triton/model_repository/romav2_bidirectional_dense/1/model.onnx
+```
+triton/model_repository/
+├── romav2_bidirectional_dense/    config.pbtxt   1/model.onnx
+├── romav2_bidirectional_sampled/  config.pbtxt   1/.gitkeep
+└── romav2_sampler/                config.pbtxt   1/model.py  1/sampler.py
 ```
 
 The generated configs target a GPU. For a CPU-only Docker run, change `kind: KIND_GPU` to `KIND_CPU` and delete the `optimization` and `parameters` blocks.
@@ -268,8 +279,8 @@ outs["precision_AB"]  # numpy (640, 640, 2, 2)
 ```
 romav2-onnx/
 ├── scripts/
-│   ├── export_onnx.py           # Export + validate (unified interface)
-│   ├── gen_triton_configs.py    # Generates triton/model_repository/*/config.pbtxt
+│   ├── export_onnx.py           # Export into the Triton repo (+ configs) and validate
+│   ├── triton_configs.py        # Triton config templates; written by the export (or standalone)
 │   ├── benchmark.py             # PyTorch vs ONNX Runtime timing + overlap-masked diffs
 │   ├── visualize.py             # Composite visualisation (ONNX or PyTorch); shared image helpers
 │   ├── triton_client.py         # Triton HTTP client for the dense models

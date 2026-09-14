@@ -3,7 +3,7 @@ platform: "onnxruntime_onnx"
 max_batch_size: 0
 
 # RoMaV2 dense matcher, "base" setting. Same module for every setting; only the
-# input size differs (see scripts/gen_triton_configs.py). Export with
+# input size differs. Written by the export together with the model:
 #   python scripts/export_onnx.py --setting base
 input [
   {
