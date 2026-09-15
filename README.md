@@ -40,11 +40,11 @@ pip install .
 The modified `romav2` source is embedded directly in `src/` — no separate clone or install step needed. It is a fork of [Parskatt/RoMaV2](https://github.com/Parskatt/RoMaV2) with the following changes required for ONNX export:
 - `enable_amp` flag added to `Matcher`, `Refiners`, `FineFeatures`, `DPTHead` and `VGG` so AMP/bfloat16 can be disabled at export time
 - `pos_embed_rope_dtype` added to `Matcher.Cfg` and `vit_from_name` to keep RoPE in float32
-- `native_torch_local_corr` vectorised (removed Python `for` loop over batch) for dynamic-batch ONNX compatibility
+- `native_torch_local_corr` loops over the correlation window offsets instead of the batch, so the batch axis stays dynamic in ONNX and no (B, C, H, W·K) intermediate is materialised (see the GPU-memory note in §2)
 - `@torch.inference_mode()` removed from `RoMaV2.forward` (blocks the JIT tracer)
 
 **For Triton server:**
-- Docker with the `nvcr.io/nvidia/tritonserver:23.12-py3` image (≈12 GB)
+- Docker with the `nvcr.io/nvidia/tritonserver:25.07-py3` image (≈12 GB); the sampler needs CuPy in the image for anything beyond a few thousand correspondences
 
 ---
 
@@ -58,7 +58,7 @@ python scripts/export_onnx.py --setting precise                               # 
 python scripts/export_onnx.py --setting fast --output romav2_fast.onnx        # 512×512 → a file elsewhere
 ```
 
-By default the export lands in the Triton model repository as `triton/model_repository/romav2_bidirectional_dense/1/model.onnx`, and **the same pass writes the Triton configs** (`config.pbtxt` of the dense model and of the sampled ensemble) for that setting's input size — see [§5.1](#51-model-repository). The repository holds one module, so the setting you export last is the one Triton serves. `--output` writes the model somewhere else (the configs are still written; `--no-triton-configs` skips them), `--triton-name` changes the module name (`<name>_dense`, `<name>_sampled`).
+By default the export lands in the Triton model repository as `triton/model_repository/romav2_bidirectional_dense/1/model.onnx`, and **the same pass writes the Triton configs** (`config.pbtxt` of the dense model and of the sampled ensemble) for that setting's input size — see [§5.1](#51-model-repository). The repository holds one module, so the setting you export last is the one Triton serves. `--output` writes the model somewhere else and then leaves the repository's configs untouched, so they keep describing the model beside them (`--triton-configs` rewrites them anyway, `--no-triton-configs` skips them for a repository export). `--triton-name` changes the module name (`<name>_dense`, `<name>_sampled`).
 
 | Setting   | Input size `S` | What runs                                                     |
 |-----------|----------------|---------------------------------------------------------------|
@@ -273,10 +273,14 @@ outs["precision_AB"]  # numpy (640, 640, 2, 2)
 `scripts/triton_eval.py` runs on the machine that hosts Triton. Phase one runs the PyTorch checkpoint on the GPU (scale Triton down first so the GPU is free) in two configurations, upstream defaults (AMP) and the fp32 export configuration, on the sample pairs of `benchmark.py`. Phase two sends the same inputs to the served module, compares where the checkpoint says the images overlap, and times the dense model and the sampled ensemble with medians over several runs; server-side times come from Triton's per-model statistics so they exclude HTTP transfer.
 
 ```bash
+# the module under test, here deployed next to the base one as romav2_precise_dense/_sampled
+python scripts/export_onnx.py --setting precise --triton-name romav2_precise
 python scripts/triton_eval.py reference --setting precise --out bench_gpu/precise_ref.npz
 python scripts/triton_eval.py triton --setting precise --name romav2_precise --url localhost:8000 \
     --ref bench_gpu/precise_ref.npz --out bench_gpu/precise_eval.json
 ```
+
+`--name` is the module name given to the export (`--triton-name`, default `romav2_bidirectional`).
 
 Precise on crazypenguins (RTX 3090, Triton 25.07), Toronto A→B, confident pixels, warp in px of the 1280 input:
 

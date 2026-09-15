@@ -1,14 +1,12 @@
 """RoMaV2 Triton Inference Client (dense models).
 
 Usage:
-    # Fast model (512x512, A->B only)
-    python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg
+    # Base module at 640 (romav2_bidirectional_dense, the defaults)
+    python scripts/triton_client.py assets/toronto_A.jpg assets/toronto_B.jpg --out result.png
 
-    # Base model at 640 (romav2_bidirectional_dense)
-    python scripts/triton_client.py A.jpg B.jpg --model romav2_bidirectional_dense --setting base
-
-    # Precise model (one 1280x1280 image per side; the graph resizes for its 800 pass)
-    python scripts/triton_client.py A.jpg B.jpg --model romav2_bidirectional_dense --setting base --out result.png
+    # A module exported with --setting precise (one 1280x1280 image per side; the
+    # graph derives its 800 pass itself), e.g. deployed as romav2_precise_dense
+    python scripts/triton_client.py A.jpg B.jpg --model romav2_precise_dense --setting precise --out result.png
 
 Every served RoMaV2 model has the same interface (img_A, img_B -> warp/overlap/precision
 for AB and BA); --setting only fixes the input size.
@@ -35,9 +33,9 @@ def infer(
     img_B_path: str,
     *,
     url: str = "localhost:8000",
-    model_name: str = "romav2",
+    model_name: str = "romav2_bidirectional_dense",
     model_version: str = "",
-    setting: str = "fast",
+    setting: str = "base",
     network_timeout: float = 600.0,
 ) -> dict[str, np.ndarray]:
     """Run inference on a Triton HTTP endpoint.

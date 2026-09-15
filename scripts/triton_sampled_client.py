@@ -1,9 +1,8 @@
 """RoMaV2 Triton sampled ensemble client.
 
 Usage:
-    python scripts/triton_sampled_client.py assets/toronto_A.jpg assets/toronto_B.jpg
-    python scripts/triton_sampled_client.py A.jpg B.jpg --model romav2_bidirectional_sampled --setting base --out sampled.png
-    python scripts/triton_sampled_client.py A.jpg B.jpg --model romav2_bidirectional_sampled --setting base --out sampled.png
+    python scripts/triton_sampled_client.py assets/toronto_A.jpg assets/toronto_B.jpg --out sampled.png
+    python scripts/triton_sampled_client.py A.jpg B.jpg --model romav2_precise_sampled --setting precise --out sampled.png
 """
 
 from __future__ import annotations
@@ -19,11 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts/ → visuali
 from visualize import INPUT_SIZES, prepare  # noqa: E402
 
 
-def _display_size(setting: str) -> int:
-    """Resolution the ensemble's matches refer to: the model's input size."""
-    return INPUT_SIZES[setting]
-
-
 def infer_sampled(
     img_a: str,
     img_b: str,
@@ -32,7 +26,7 @@ def infer_sampled(
     model_name: str,
     num_corresp: int,
     seed: int,
-    setting: str = "fast",
+    setting: str = "base",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     try:
         import tritonclient.http as httpclient
@@ -82,12 +76,14 @@ def visualise_sampled(
     confidence: np.ndarray,
     out_path: str,
     *,
-    setting: str = "fast",
+    setting: str = "base",
     max_lines: int = 512,
 ) -> None:
-    size = _display_size(setting)
-    img_a = Image.open(img_a_path).convert("RGB").resize((size, size), Image.LANCZOS)
-    img_b = Image.open(img_b_path).convert("RGB").resize((size, size), Image.LANCZOS)
+    # The matches refer to the model's input frame: draw on the very images the
+    # request was built from (prepare(): the model's input size, same filter).
+    disp_a, disp_b, _ = prepare(img_a_path, img_b_path, setting)
+    img_a, img_b = Image.fromarray(disp_a), Image.fromarray(disp_b)
+    size = img_a.width
     canvas = Image.new("RGB", (size * 2, size), "white")
     canvas.paste(img_a, (0, 0))
     canvas.paste(img_b, (size, 0))

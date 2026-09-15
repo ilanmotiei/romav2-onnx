@@ -35,8 +35,8 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 # Input size per setting: what the exported model takes (precise derives its 800
-# low-res pass in-graph from the 1280 input). Mirrors scripts/visualize.INPUT_SIZES.
-INPUT_SIZES = {"turbo": 320, "fast": 512, "base": 640, "precise": 1280}
+# low-res pass in-graph from the 1280 input). The one table every script shares.
+from triton_configs import SIZES as INPUT_SIZES  # noqa: E402
 
 
 # ── samples ──────────────────────────────────────────────────────────────────

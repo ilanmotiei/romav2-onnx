@@ -31,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))               # scripts
 
 # Input size per setting — the image the exported model takes (H_hr for the
 # two-stage precise setting, which derives its 800 low-res pass in-graph).
-INPUT_SIZES = {"turbo": 320, "fast": 512, "base": 640, "precise": 1280}
+# One table for every script: it lives next to the Triton config templates.
+from triton_configs import SIZES as INPUT_SIZES  # noqa: E402
 
 
 # ── inputs ───────────────────────────────────────────────────────────────────

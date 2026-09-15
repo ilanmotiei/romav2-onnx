@@ -45,7 +45,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from benchmark import INPUT_SIZES, make_samples, resize, to_tensor  # noqa: E402
-from triton_configs import DEFAULT_NAME, model_names  # noqa: E402
+from triton_configs import DEFAULT_NAME, SAMPLER, model_names  # noqa: E402
 
 DIRS = ("AB", "BA")
 KEYS = ("warp", "overlap", "precision")
@@ -270,7 +270,7 @@ def triton(setting: str, name: str, url: str, ref_path: str, out: str, *,
     for n in num_corresps:
         wall, server, dense_c, sampler_c, shapes = [], [], [], [], set()
         for i in range(sampled_runs + 1):
-            s0 = {m: _stats(client, m) for m in (sampled, dense, "romav2_sampler")}
+            s0 = {m: _stats(client, m) for m in (sampled, dense, SAMPLER)}
             t = time.perf_counter()
             outs = _infer_sampled(client, sampled, a, b, n, seed + i)
             w = time.perf_counter() - t
@@ -278,7 +278,7 @@ def triton(setting: str, name: str, url: str, ref_path: str, out: str, *,
             shapes.add(tuple(outs["sampled_matches"].shape))
             if i:
                 wall.append(w * 1000); server.append(d[sampled]["success"])
-                dense_c.append(d[dense]["compute_infer"]); sampler_c.append(d["romav2_sampler"]["compute_infer"])
+                dense_c.append(d[dense]["compute_infer"]); sampler_c.append(d[SAMPLER]["compute_infer"])
         report["sampled_timing"][str(n)] = {
             "wall_ms": wall, "server_ms": server, "dense_compute_ms": dense_c, "sampler_compute_ms": sampler_c,
             "matches_shape": sorted(shapes),

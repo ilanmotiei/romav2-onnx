@@ -27,7 +27,7 @@ describes the model that was exported last:
 Usage:
     python scripts/export_onnx.py --setting base                  # -> model repository
     python scripts/export_onnx.py --setting precise               # same module, 1280 input
-    python scripts/export_onnx.py --setting fast --output romav2_fast.onnx   # elsewhere
+    python scripts/export_onnx.py --setting fast --output romav2_fast.onnx   # elsewhere; configs untouched
 
     # TensorRT-ready (bakes RoPE -> no If/Range so TensorRT can parse the graph):
     python scripts/export_onnx.py --setting base --trt
@@ -326,16 +326,22 @@ def export(
     opset: int = 18,
     trt: bool = False,
     triton_name: str = DEFAULT_NAME,
-    triton_configs: bool = True,
+    triton_configs: bool | None = None,
 ) -> Path:
     """Export one setting to ONNX and write the matching Triton configs.
 
     With ``output_path`` unset the model goes to the dense model's version
-    directory in the Triton repository.  ``triton_configs`` writes the dense
-    and sampled config.pbtxt for this setting's input size in the same pass
-    (the repository holds one module, so the last export wins).
+    directory in the Triton repository, and the dense and sampled config.pbtxt
+    for this setting's input size are written in the same pass (the repository
+    holds one module, so the last export wins).  A model written elsewhere
+    with ``output_path`` leaves the repository's configs untouched, so they
+    keep describing the model that sits beside them; ``triton_configs`` True
+    forces the rewrite, False skips it even for a repository export.
     """
     output_path = Path(output_path) if output_path else default_output(setting, triton_name)
+    in_repo = output_path.resolve() == default_output(setting, triton_name).resolve()
+    if triton_configs is None:
+        triton_configs = in_repo
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wrapper = build_model(setting)
     H, W = wrapper.model.H_lr, wrapper.model.W_lr
@@ -375,9 +381,11 @@ def export(
         assert size == SIZES[setting], f"triton_configs.SIZES[{setting!r}] != exported size {size}"
         for path in write_triton_configs(setting, size, triton_name):
             print(f"Wrote  → {path}")
-        dense_dir = TRITON_REPO / model_names(triton_name)[0]
-        if output_path.resolve() != (dense_dir / "1" / "model.onnx").resolve():
-            print(f"note: Triton expects the model at {dense_dir / '1' / 'model.onnx'}")
+        if not in_repo:
+            print(f"note: Triton expects the model at {default_output(setting, triton_name)}")
+    elif not in_repo:
+        print(f"note: model written outside the Triton repository; its configs were left "
+              f"untouched (--triton-configs rewrites them for '{setting}')")
     return output_path
 
 
@@ -439,6 +447,14 @@ def _compare_direction(d, pt, ox, *, warp_atol, overlap_atol, precision_rtol,
         failures.append(f"{d}: precision rel diff p99 in confident pixels "
                         f"{np.percentile(rm, 99):.3f} > {precision_rtol}")
     return failures
+
+
+def _require_finite(engine: str, names, arrays) -> None:
+    """NaN/inf never pass: every masked check below is a `>` comparison, which is
+    False for NaN, so a model emitting NaN would otherwise 'pass'."""
+    bad = [n for n, a in zip(names, arrays) if not np.isfinite(a).all()]
+    if bad:
+        raise SystemExit(f"Validation FAILED: non-finite values in {engine} outputs {bad}")
 
 
 def validate(onnx_path: str, setting: str = "fast", *,
@@ -526,6 +542,8 @@ def validate(onnx_path: str, setting: str = "fast", *,
 
     # ── Step 5: compare outputs ───────────────────────────────────────────────
     print("[5/5] Comparing outputs (confidence-masked, see validate.__doc__) ...")
+    _require_finite("PyTorch", output_names, pt_outs)
+    _require_finite("ONNX", output_names, onnx_outs)
     pt = {n: a[0] for n, a in zip(output_names, pt_outs)}
     ox = {n: a[0] for n, a in zip(output_names, onnx_outs)}
     failures = []
@@ -559,8 +577,12 @@ if __name__ == "__main__":
     parser.add_argument("--triton-name", default=DEFAULT_NAME,
                         help=f"Triton module name: models <name>_dense and <name>_sampled "
                              f"(default {DEFAULT_NAME})")
-    parser.add_argument("--no-triton-configs", action="store_true",
-                        help="export only; do not (re)write the Triton config.pbtxt files")
+    cfg = parser.add_mutually_exclusive_group()
+    cfg.add_argument("--triton-configs", action="store_true",
+                     help="(re)write the Triton config.pbtxt files even when --output "
+                          "puts the model outside the repository")
+    cfg.add_argument("--no-triton-configs", action="store_true",
+                     help="export only; leave the Triton config.pbtxt files untouched")
     parser.add_argument("--img-a", default=str(DEFAULT_PAIR[0]),
                         help="(--validate) image A, resized like RoMaV2.match() does")
     parser.add_argument("--img-b", default=str(DEFAULT_PAIR[1]),
@@ -582,4 +604,5 @@ if __name__ == "__main__":
                  img_a=args.img_a, img_b=args.img_b, warp_atol=args.warp_atol)
     else:
         export(args.output, setting=args.setting, opset=args.opset, trt=args.trt,
-               triton_name=args.triton_name, triton_configs=not args.no_triton_configs)
+               triton_name=args.triton_name,
+               triton_configs=True if args.triton_configs else False if args.no_triton_configs else None)
