@@ -1,25 +1,21 @@
 """RoMaV2 Triton sampled ensemble client.
 
 Usage:
-    python scripts/triton_sampled_client.py assets/toronto_A.jpg assets/toronto_B.jpg
     python scripts/triton_sampled_client.py assets/toronto_A.jpg assets/toronto_B.jpg --out sampled.png
+    python scripts/triton_sampled_client.py A.jpg B.jpg --model romav2_precise_sampled --setting precise --out sampled.png
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-
-MODEL_H = MODEL_W = 512
-
-
-def load_image(path: str) -> np.ndarray:
-    img = Image.open(path).convert("RGB").resize((MODEL_W, MODEL_H), Image.LANCZOS)
-    arr = np.array(img, dtype=np.float32) / 255.0
-    return arr.transpose(2, 0, 1)[None]
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts/ → visualize helpers
+from visualize import INPUT_SIZES, prepare  # noqa: E402
 
 
 def infer_sampled(
@@ -30,27 +26,26 @@ def infer_sampled(
     model_name: str,
     num_corresp: int,
     seed: int,
+    setting: str = "base",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     try:
         import tritonclient.http as httpclient
     except ImportError:
         raise SystemExit("tritonclient is required: pip install tritonclient[http]")
 
-    image_a = load_image(img_a)
-    image_b = load_image(img_b)
+    _, _, images = prepare(img_a, img_b, setting)   # named inputs the setting defines
     num = np.array([num_corresp], dtype=np.int64)
     seed_arr = np.array([seed], dtype=np.int64)
 
-    inputs = [
-        httpclient.InferInput("img_A", image_a.shape, "FP32"),
-        httpclient.InferInput("img_B", image_b.shape, "FP32"),
-        httpclient.InferInput("num_corresp", num.shape, "INT64"),
-        httpclient.InferInput("seed", seed_arr.shape, "INT64"),
-    ]
-    inputs[0].set_data_from_numpy(image_a)
-    inputs[1].set_data_from_numpy(image_b)
-    inputs[2].set_data_from_numpy(num)
-    inputs[3].set_data_from_numpy(seed_arr)
+    inputs = []
+    for name, arr in images.items():
+        inp = httpclient.InferInput(name, arr.shape, "FP32")
+        inp.set_data_from_numpy(arr)
+        inputs.append(inp)
+    for name, arr in (("num_corresp", num), ("seed", seed_arr)):
+        inp = httpclient.InferInput(name, arr.shape, "INT64")
+        inp.set_data_from_numpy(arr)
+        inputs.append(inp)
 
     outputs = [
         httpclient.InferRequestedOutput("sampled_matches"),
@@ -58,7 +53,7 @@ def infer_sampled(
         httpclient.InferRequestedOutput("sampled_precision_A"),
         httpclient.InferRequestedOutput("sampled_precision_B"),
     ]
-    client = httpclient.InferenceServerClient(url=url)
+    client = httpclient.InferenceServerClient(url=url, network_timeout=600.0, connection_timeout=600.0)
     response = client.infer(model_name=model_name, inputs=inputs, outputs=outputs)
     return (
         response.as_numpy("sampled_matches"),
@@ -81,18 +76,22 @@ def visualise_sampled(
     confidence: np.ndarray,
     out_path: str,
     *,
+    setting: str = "base",
     max_lines: int = 512,
 ) -> None:
-    img_a = Image.open(img_a_path).convert("RGB").resize((MODEL_W, MODEL_H), Image.LANCZOS)
-    img_b = Image.open(img_b_path).convert("RGB").resize((MODEL_W, MODEL_H), Image.LANCZOS)
-    canvas = Image.new("RGB", (MODEL_W * 2, MODEL_H), "white")
+    # The matches refer to the model's input frame: draw on the very images the
+    # request was built from (prepare(): the model's input size, same filter).
+    disp_a, disp_b, _ = prepare(img_a_path, img_b_path, setting)
+    img_a, img_b = Image.fromarray(disp_a), Image.fromarray(disp_b)
+    size = img_a.width
+    canvas = Image.new("RGB", (size * 2, size), "white")
     canvas.paste(img_a, (0, 0))
-    canvas.paste(img_b, (MODEL_W, 0))
+    canvas.paste(img_b, (size, 0))
 
     count = min(max_lines, matches.shape[0])
     order = np.argsort(confidence)[::-1][:count]
-    pts_a = _to_pixel(matches[order, :2], width=MODEL_W, height=MODEL_H)
-    pts_b = _to_pixel(matches[order, 2:], width=MODEL_W, height=MODEL_H)
+    pts_a = _to_pixel(matches[order, :2], width=size, height=size)
+    pts_b = _to_pixel(matches[order, 2:], width=size, height=size)
     conf = confidence[order]
     conf_min = float(conf.min()) if conf.size else 0.0
     conf_max = float(conf.max()) if conf.size else 1.0
@@ -110,7 +109,7 @@ def visualise_sampled(
         )
         x_a, y_a = point_a
         x_b, y_b = point_b
-        x_b += MODEL_W
+        x_b += size
         draw.line([(x_a, y_a), (x_b, y_b)], fill=color, width=1)
         draw.ellipse((x_a - 2, y_a - 2, x_a + 2, y_a + 2), fill=color)
         draw.ellipse((x_b - 2, y_b - 2, x_b + 2, y_b + 2), fill=color)
@@ -126,6 +125,9 @@ def main():
     parser.add_argument("img_b")
     parser.add_argument("--url", default="localhost:8000")
     parser.add_argument("--model", default="romav2_bidirectional_sampled")
+    parser.add_argument("--setting", default="base", choices=list(INPUT_SIZES),
+                        help="setting the ensemble's dense model was exported with "
+                             "(romav2_bidirectional_sampled: base/640)")
     parser.add_argument("--num-corresp", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=-1,
                         help="Sampling seed; -1 uses non-deterministic sampling")
@@ -142,6 +144,7 @@ def main():
         model_name=args.model,
         num_corresp=args.num_corresp,
         seed=args.seed,
+        setting=args.setting,
     )
     print(f"sampled_matches:     shape={matches.shape}, min={matches.min():.4f}, max={matches.max():.4f}")
     print(f"sampled_confidence:  shape={confidence.shape}, min={confidence.min():.4f}, max={confidence.max():.4f}")
@@ -154,6 +157,7 @@ def main():
             matches,
             confidence,
             args.out,
+            setting=args.setting,
             max_lines=args.max_lines,
         )
 
